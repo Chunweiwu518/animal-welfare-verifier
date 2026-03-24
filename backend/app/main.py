@@ -1,8 +1,11 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
 from app.routes.search import router as search_router
+from app.services.persistence_service import PersistenceService
 
 settings = get_settings()
 allow_all_origins = settings.cors_allow_origins.strip() == "*"
@@ -12,7 +15,14 @@ allow_origins = (
     else [item.strip() for item in settings.cors_allow_origins.split(",") if item.strip()]
 )
 
-app = FastAPI(title=settings.app_name)
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    PersistenceService(settings).initialize()
+    yield
+
+
+app = FastAPI(title=settings.app_name, lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allow_origins,

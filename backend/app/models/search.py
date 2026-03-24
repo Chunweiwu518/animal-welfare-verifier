@@ -12,6 +12,7 @@ class EvidenceCard(BaseModel):
     title: str
     url: HttpUrl
     source: str
+    source_type: Literal["official", "news", "forum", "social", "other"]
     snippet: str
     extracted_at: str | None = None
     published_at: str | None = None
@@ -19,6 +20,10 @@ class EvidenceCard(BaseModel):
     claim_type: str
     evidence_strength: Literal["weak", "medium", "strong"]
     first_hand_score: int = Field(ge=0, le=100)
+    relevance_score: int = Field(ge=0, le=100)
+    credibility_score: int = Field(ge=0, le=100)
+    recency_label: Literal["recent", "dated", "unknown"]
+    duplicate_risk: Literal["low", "medium", "high"]
     notes: str
 
 

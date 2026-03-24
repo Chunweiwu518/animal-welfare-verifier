@@ -12,3 +12,4 @@ frontend/*.tsbuildinfo
 backend/.venv/
 backend/.mypy_cache/
 backend/.ruff_cache/
+backend/data/

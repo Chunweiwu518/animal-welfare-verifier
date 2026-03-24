@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 import httpx
+from trafilatura.metadata import extract_metadata
 
 from app.config import Settings
 
@@ -51,15 +52,49 @@ class SearchService:
                 payload = response.json()
                 aggregated.extend(payload.get("results", []))
 
+            enriched_results = []
+            for item in aggregated:
+                enriched_results.append(await self._enrich_result(item, client))
+
         seen: set[str] = set()
         unique_results = []
-        for item in aggregated:
+        for item in enriched_results:
             url = item.get("url")
             if not url or url in seen:
                 continue
             seen.add(url)
             unique_results.append(item)
         return unique_results[:10]
+
+    async def _enrich_result(self, item: dict, client: httpx.AsyncClient) -> dict:
+        enriched = dict(item)
+        enriched.setdefault("fetched_at", datetime.now(timezone.utc).isoformat())
+        if enriched.get("published_date") and enriched.get("source"):
+            return enriched
+
+        url = enriched.get("url")
+        if not url:
+            return enriched
+
+        try:
+            response = await client.get(
+                url,
+                follow_redirects=True,
+                timeout=8.0,
+                headers={"User-Agent": "AnimalWelfareVerifier/0.1"},
+            )
+            response.raise_for_status()
+            metadata = extract_metadata(response.text, default_url=str(response.url))
+        except Exception:
+            return enriched
+
+        if not enriched.get("published_date") and getattr(metadata, "date", None):
+            enriched["published_date"] = metadata.date
+        if not enriched.get("source") and getattr(metadata, "sitename", None):
+            enriched["source"] = metadata.sitename
+        if not enriched.get("title") and getattr(metadata, "title", None):
+            enriched["title"] = metadata.title
+        return enriched
 
     def _mock_results(self, entity_name: str, question: str) -> list[dict]:
         now = datetime.now(timezone.utc).isoformat()

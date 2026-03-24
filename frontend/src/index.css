@@ -2,11 +2,12 @@
   font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
   line-height: 1.5;
   font-weight: 400;
-  color: #1c1917;
+  color: #1f1a17;
   background:
-    radial-gradient(circle at top left, rgba(251, 191, 36, 0.18), transparent 30%),
-    radial-gradient(circle at 85% 15%, rgba(249, 115, 22, 0.16), transparent 24%),
-    linear-gradient(180deg, #fffaf3 0%, #f7efe3 100%);
+    radial-gradient(circle at top left, rgba(255, 196, 86, 0.3), transparent 28%),
+    radial-gradient(circle at 82% 10%, rgba(29, 77, 79, 0.14), transparent 24%),
+    radial-gradient(circle at 50% 100%, rgba(217, 122, 31, 0.12), transparent 28%),
+    linear-gradient(180deg, #fffdf8 0%, #f3ecdf 56%, #efe6d7 100%);
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
@@ -19,12 +20,26 @@
 
 html {
   min-width: 320px;
+  scroll-behavior: smooth;
 }
 
 body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.16) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.12) 1px, transparent 1px);
+  background-size: 32px 32px;
+  mask-image: radial-gradient(circle at center, black 30%, transparent 85%);
+  opacity: 0.55;
 }
 
 a {
@@ -39,4 +54,8 @@ textarea {
 
 button {
   cursor: pointer;
+}
+
+#root {
+  isolation: isolate;
 }

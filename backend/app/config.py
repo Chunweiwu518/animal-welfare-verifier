@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     app_env: str = "development"
     frontend_origin: str = "http://localhost:5173"
     cors_allow_origins: str = "*"
+    database_path: str = "data/animal_welfare_verifier.db"
     tavily_api_key: str | None = None
     openai_api_key: str | None = None
     openai_model: str = "gpt-4.1-mini"

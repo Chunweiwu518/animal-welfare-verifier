@@ -1,8 +1,10 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 
 from app.config import Settings, get_settings
+from app.models.profile import EntityProfileResponse
 from app.models.search import SearchRequest, SearchResponse
 from app.services.analysis_service import AnalysisService
+from app.services.persistence_service import PersistenceService
 from app.services.search_service import SearchService
 
 router = APIRouter(prefix="/api", tags=["search"])
@@ -13,6 +15,18 @@ async def healthcheck() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@router.get("/entities/{entity_name}/profile", response_model=EntityProfileResponse)
+async def get_entity_profile(
+    entity_name: str,
+    settings: Settings = Depends(get_settings),
+) -> EntityProfileResponse:
+    persistence_service = PersistenceService(settings)
+    profile = persistence_service.get_entity_profile(entity_name)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="Entity profile not found")
+    return profile
+
+
 @router.post("/search", response_model=SearchResponse)
 async def search_reputation(
     request: SearchRequest,
@@ -20,6 +34,7 @@ async def search_reputation(
 ) -> SearchResponse:
     search_service = SearchService(settings)
     analysis_service = AnalysisService(settings)
+    persistence_service = PersistenceService(settings)
 
     expanded_queries, raw_results, mode = await search_service.search(
         entity_name=request.entity_name,
@@ -29,6 +44,14 @@ async def search_reputation(
         entity_name=request.entity_name,
         question=request.question,
         raw_results=raw_results,
+    )
+    persistence_service.save_search_run(
+        entity_name=request.entity_name,
+        question=request.question,
+        expanded_queries=expanded_queries,
+        mode=mode,
+        summary=summary,
+        evidence_cards=evidence_cards,
     )
 
     return SearchResponse(

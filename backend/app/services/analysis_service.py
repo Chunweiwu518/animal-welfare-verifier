@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from datetime import date, datetime
 from typing import Any
 
 try:
@@ -22,7 +23,8 @@ class AnalysisService:
         question: str,
         raw_results: list[dict[str, Any]],
     ) -> tuple[BalancedSummary, list[EvidenceCard]]:
-        cards = [self._to_card(result, question) for result in raw_results]
+        cards = [self._to_card(result, entity_name, question) for result in raw_results]
+        cards = self._rank_and_filter_cards(cards)
         if self.settings.openai_api_key and AsyncOpenAI is not None:
             try:
                 summary = await self._summarize_with_openai(entity_name, question, cards)
@@ -31,12 +33,12 @@ class AnalysisService:
                 return self._summarize_heuristically(cards, question), cards
         return self._summarize_heuristically(cards, question), cards
 
-    def _to_card(self, result: dict[str, Any], question: str) -> EvidenceCard:
+    def _to_card(self, result: dict[str, Any], entity_name: str, question: str) -> EvidenceCard:
         text = (
             result.get("content")
             or result.get("raw_content")
             or result.get("snippet")
-            or "No snippet available."
+            or "目前沒有可用的摘要內容。"
         )
         lower = text.lower()
 
@@ -51,20 +53,46 @@ class AnalysisService:
             evidence_strength = "weak"
 
         claim_type = self._claim_type(question, text)
+        source = result.get("source") or self._source_name(result.get("url", ""))
+        source_type = self._source_type(result.get("url", ""), result.get("source"))
+        published_at = result.get("published_date")
         first_hand_score = 85 if any(word in text for word in ["實地", "參訪", "親自", "我看到"]) else 40
+        relevance_score = self._relevance_score(entity_name, question, result.get("title") or "", text)
+        recency_label = self._recency_label(published_at)
+        duplicate_risk = self._duplicate_risk(result.get("url", ""), result.get("title") or "")
+        credibility_score = self._credibility_score(
+            source_type=source_type,
+            first_hand_score=first_hand_score,
+            relevance_score=relevance_score,
+            recency_label=recency_label,
+            duplicate_risk=duplicate_risk,
+        )
 
         return EvidenceCard(
-            title=result.get("title") or "Untitled evidence",
+            title=result.get("title") or "未命名來源",
             url=result["url"],
-            source=result.get("source") or self._source_name(result.get("url", "")),
+            source=source,
+            source_type=source_type,
             snippet=text[:700],
             extracted_at=result.get("fetched_at"),
-            published_at=result.get("published_date"),
+            published_at=published_at,
             stance=stance,
             claim_type=claim_type,
             evidence_strength=evidence_strength,
             first_hand_score=first_hand_score,
-            notes=self._notes_for_card(stance, evidence_strength, first_hand_score),
+            relevance_score=relevance_score,
+            credibility_score=credibility_score,
+            recency_label=recency_label,
+            duplicate_risk=duplicate_risk,
+            notes=self._notes_for_card(
+                stance=stance,
+                strength=evidence_strength,
+                first_hand_score=first_hand_score,
+                credibility_score=credibility_score,
+                relevance_score=relevance_score,
+                recency_label=recency_label,
+                duplicate_risk=duplicate_risk,
+            ),
         )
 
     def _claim_type(self, question: str, text: str) -> str:
@@ -79,17 +107,176 @@ class AnalysisService:
             return "animal_welfare"
         return "general_reputation"
 
-    def _notes_for_card(self, stance: str, strength: str, first_hand_score: int) -> str:
+    def _notes_for_card(
+        self,
+        stance: str,
+        strength: str,
+        first_hand_score: int,
+        credibility_score: int,
+        relevance_score: int,
+        recency_label: str,
+        duplicate_risk: str,
+    ) -> str:
         perspective = {
-            "supporting": "This source supports the concern raised by the user.",
-            "opposing": "This source pushes back on the concern or highlights improvements.",
-            "neutral": "This source gives context without clearly taking a side.",
-            "unclear": "The stance is ambiguous and needs manual review.",
+            "supporting": "這則來源內容較支持使用者提出的疑慮。",
+            "opposing": "這則來源內容較偏向反駁疑慮，或提到改善與回應。",
+            "neutral": "這則來源主要提供背景資訊，沒有明確站在某一邊。",
+            "unclear": "這則來源立場不夠清楚，建議人工再讀原文確認。",
         }[stance]
-        return f"{perspective} Evidence strength is {strength}. First-hand score: {first_hand_score}/100."
+        strength_label = {
+            "weak": "弱",
+            "medium": "中",
+            "strong": "強",
+        }[strength]
+        recency_text = {
+            "recent": "近期",
+            "dated": "較舊",
+            "unknown": "時間未知",
+        }[recency_label]
+        duplicate_text = {
+            "low": "低",
+            "medium": "中",
+            "high": "高",
+        }[duplicate_risk]
+        return (
+            f"{perspective} 證據強度為{strength_label}，第一手程度為 {first_hand_score}/100，"
+            f"相關性 {relevance_score}/100，可信度 {credibility_score}/100，"
+            f"時間判讀為{recency_text}，重複轉載風險為{duplicate_text}。"
+        )
 
     def _source_name(self, url: str) -> str:
-        return url.split("/")[2] if "://" in url else "Unknown"
+        return url.split("/")[2] if "://" in url else "未知來源"
+
+    def _source_type(self, url: str, source: str | None) -> str:
+        host = (source or self._source_name(url)).lower()
+
+        official_markers = [
+            ".gov",
+            ".gov.tw",
+            ".edu",
+            ".org.tw",
+            "official",
+            "zoo.gov.taipei",
+        ]
+        news_markers = [
+            "news",
+            "ettoday",
+            "yahoo",
+            "ltn",
+            "udn",
+            "cna",
+            "newslens",
+            "chinatimes",
+            "cts",
+            "tvbs",
+            "storm",
+        ]
+        forum_markers = [
+            "ptt",
+            "dcard",
+            "mobile01",
+            "forum",
+            "disp",
+        ]
+        social_markers = [
+            "facebook",
+            "instagram",
+            "threads.net",
+            "x.com",
+            "twitter",
+            "youtube",
+            "tiktok",
+            "line.me",
+        ]
+
+        if any(marker in host for marker in official_markers):
+            return "official"
+        if any(marker in host for marker in news_markers):
+            return "news"
+        if any(marker in host for marker in forum_markers):
+            return "forum"
+        if any(marker in host for marker in social_markers):
+            return "social"
+        return "other"
+
+    def _relevance_score(self, entity_name: str, question: str, title: str, text: str) -> int:
+        haystack = f"{title} {text}".lower()
+        entity_tokens = [token.lower() for token in entity_name.replace("　", " ").split() if token.strip()]
+        if not entity_tokens:
+            entity_tokens = [entity_name.lower()]
+
+        question_keywords = [
+            keyword
+            for keyword in ["詐騙", "退款", "爭議", "動物", "福利", "募資", "透明", "環境", "評價"]
+            if keyword in question
+        ]
+
+        score = 20
+        if any(token and token in haystack for token in entity_tokens):
+            score += 35
+        if entity_name.lower() in haystack:
+            score += 20
+        score += min(25, sum(8 for keyword in question_keywords if keyword.lower() in haystack))
+        if "search?" in haystack or "prequalify" in haystack or "credit card" in haystack:
+            score -= 35
+        return max(0, min(100, score))
+
+    def _recency_label(self, published_at: str | None) -> str:
+        if not published_at:
+            return "unknown"
+
+        raw = published_at.split("T")[0]
+        try:
+            published_date = date.fromisoformat(raw)
+        except ValueError:
+            try:
+                published_date = datetime.fromisoformat(published_at.replace("Z", "+00:00")).date()
+            except ValueError:
+                return "unknown"
+
+        days_old = (date.today() - published_date).days
+        if days_old <= 365:
+            return "recent"
+        return "dated"
+
+    def _duplicate_risk(self, url: str, title: str) -> str:
+        normalized = f"{url} {title}".lower()
+        if any(marker in normalized for marker in ["yahoo.com", "msn.com", "line.today"]):
+            return "high"
+        if any(marker in normalized for marker in ["news", "rss", "xml"]):
+            return "medium"
+        return "low"
+
+    def _credibility_score(
+        self,
+        source_type: str,
+        first_hand_score: int,
+        relevance_score: int,
+        recency_label: str,
+        duplicate_risk: str,
+    ) -> int:
+        base = {
+            "official": 78,
+            "news": 68,
+            "forum": 48,
+            "social": 42,
+            "other": 36,
+        }[source_type]
+        recency_bonus = {"recent": 8, "dated": 0, "unknown": -4}[recency_label]
+        duplicate_penalty = {"low": 0, "medium": -6, "high": -12}[duplicate_risk]
+        score = base + recency_bonus + duplicate_penalty + round(first_hand_score * 0.12) + round(relevance_score * 0.18)
+        return max(0, min(100, score))
+
+    def _rank_and_filter_cards(self, cards: list[EvidenceCard]) -> list[EvidenceCard]:
+        sorted_cards = sorted(
+            cards,
+            key=lambda card: (card.relevance_score, card.credibility_score, card.first_hand_score),
+            reverse=True,
+        )
+        filtered_cards = [card for card in sorted_cards if card.relevance_score >= 35]
+        if filtered_cards:
+            return filtered_cards[:10]
+        return sorted_cards[:5]
 
     def _summarize_heuristically(self, cards: list[EvidenceCard], question: str) -> BalancedSummary:
         stances = Counter(card.stance for card in cards)
