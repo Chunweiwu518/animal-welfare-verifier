@@ -1,0 +1,14 @@
+[Unit]
+Description=Animal Welfare Verifier Backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/steven/animal-welfare-verifier
+ExecStart=/home/steven/animal-welfare-verifier/scripts/start-backend.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
