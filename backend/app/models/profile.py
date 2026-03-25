@@ -14,8 +14,25 @@ class RecentQueryItem(BaseModel):
     created_at: str
 
 
+class EntityAliasRequest(BaseModel):
+    canonical_name: str
+    alias: str
+
+
+class EntityListItem(BaseModel):
+    entity_name: str
+    aliases: list[str]
+    total_queries: int = Field(ge=0)
+    total_sources: int = Field(ge=0)
+
+
+class EntityListResponse(BaseModel):
+    items: list[EntityListItem]
+
+
 class EntityProfileResponse(BaseModel):
     entity_name: str
+    aliases: list[str]
     total_queries: int = Field(ge=0)
     total_sources: int = Field(ge=0)
     average_confidence: int = Field(ge=0, le=100)

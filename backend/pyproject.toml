@@ -17,6 +17,10 @@ dependencies = [
 llm = [
   "openai>=1.68.0",
 ]
+scrapers = [
+  "beautifulsoup4>=4.12.0",
+  "facebook-scraper>=0.2.60",
+]
 
 [dependency-groups]
 dev = [

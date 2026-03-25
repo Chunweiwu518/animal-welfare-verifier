@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
+from app.routes.media import router as media_router
 from app.routes.search import router as search_router
 from app.services.persistence_service import PersistenceService
 
@@ -31,3 +32,4 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(search_router)
+app.include_router(media_router)

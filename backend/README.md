@@ -13,3 +13,9 @@ FastAPI service for:
 ~/.local/bin/uv sync
 ~/.local/bin/uv run uvicorn app.main:app --reload
 ```
+
+## Import entity aliases
+
+```bash
+~/.local/bin/uv run python scripts/import_entity_aliases.py examples/entity_aliases.example.csv
+```

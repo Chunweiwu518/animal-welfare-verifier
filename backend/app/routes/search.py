@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 
 from app.config import Settings, get_settings
-from app.models.profile import EntityProfileResponse
+from app.models.profile import EntityAliasRequest, EntityListResponse, EntityProfileResponse
 from app.models.search import SearchRequest, SearchResponse
 from app.services.analysis_service import AnalysisService
 from app.services.persistence_service import PersistenceService
@@ -25,6 +25,29 @@ async def get_entity_profile(
     if profile is None:
         raise HTTPException(status_code=404, detail="Entity profile not found")
     return profile
+
+
+@router.post("/entities/alias")
+async def register_entity_alias(
+    request: EntityAliasRequest,
+    settings: Settings = Depends(get_settings),
+) -> dict[str, str]:
+    persistence_service = PersistenceService(settings)
+    persistence_service.register_entity_alias(
+        canonical_name=request.canonical_name.strip(),
+        alias=request.alias.strip(),
+    )
+    return {"status": "ok"}
+
+
+@router.get("/entities", response_model=EntityListResponse)
+async def list_entities(
+    q: str | None = None,
+    limit: int = 20,
+    settings: Settings = Depends(get_settings),
+) -> EntityListResponse:
+    persistence_service = PersistenceService(settings)
+    return persistence_service.list_entities(query=q, limit=min(max(limit, 1), 100))
 
 
 @router.post("/search", response_model=SearchResponse)

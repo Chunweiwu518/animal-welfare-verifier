@@ -1,13 +1,9 @@
 :root {
-  font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
-  line-height: 1.5;
+  font-family: "Noto Sans TC", "Segoe UI", system-ui, sans-serif;
+  line-height: 1.6;
   font-weight: 400;
-  color: #1f1a17;
-  background:
-    radial-gradient(circle at top left, rgba(255, 196, 86, 0.3), transparent 28%),
-    radial-gradient(circle at 82% 10%, rgba(29, 77, 79, 0.14), transparent 24%),
-    radial-gradient(circle at 50% 100%, rgba(217, 122, 31, 0.12), transparent 28%),
-    linear-gradient(180deg, #fffdf8 0%, #f3ecdf 56%, #efe6d7 100%);
+  color: #1a1d23;
+  background: #f5f6f8;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
@@ -16,6 +12,8 @@
 
 * {
   box-sizing: border-box;
+  margin: 0;
+  padding: 0;
 }
 
 html {
@@ -24,36 +22,29 @@ html {
 }
 
 body {
-  margin: 0;
   min-width: 320px;
   min-height: 100vh;
 }
 
-body::before {
-  content: "";
-  position: fixed;
-  inset: 0;
-  pointer-events: none;
-  background-image:
-    linear-gradient(rgba(255, 255, 255, 0.16) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255, 255, 255, 0.12) 1px, transparent 1px);
-  background-size: 32px 32px;
-  mask-image: radial-gradient(circle at center, black 30%, transparent 85%);
-  opacity: 0.55;
-}
-
 a {
   text-decoration: none;
+  color: inherit;
 }
 
 button,
 input,
 textarea {
   font: inherit;
+  border: none;
+  background: none;
 }
 
 button {
   cursor: pointer;
+}
+
+ul, ol {
+  list-style: none;
 }
 
 #root {

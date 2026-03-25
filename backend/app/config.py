@@ -12,6 +12,11 @@ class Settings(BaseSettings):
     tavily_api_key: str | None = None
     openai_api_key: str | None = None
     openai_model: str = "gpt-4.1-mini"
+    serpapi_api_key: str | None = None
+    facebook_cookies_path: str | None = None
+    facebook_page_ids: str | None = None  # comma-separated page IDs
+    media_upload_dir: str = "data/media"
+    max_upload_size_mb: int = 200  # max single file size in MB
 
     model_config = SettingsConfigDict(
         env_file=".env",

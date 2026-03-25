@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 from datetime import datetime, timezone
 
 import httpx
 from trafilatura.metadata import extract_metadata
 
 from app.config import Settings
+
+logger = logging.getLogger(__name__)
 
 
 class SearchService:
@@ -25,13 +29,84 @@ class SearchService:
 
     async def search(self, entity_name: str, question: str) -> tuple[list[str], list[dict], str]:
         queries = self.build_queries(entity_name, question)
-        if not self.settings.tavily_api_key:
+
+        # Run all scrapers in parallel
+        tasks: list[asyncio.Task] = []
+
+        # Tavily (Google search proxy)
+        if self.settings.tavily_api_key:
+            tasks.append(asyncio.create_task(self._search_tavily(queries)))
+
+        # Platform-specific scrapers
+        tasks.append(asyncio.create_task(self._search_platforms(entity_name)))
+
+        if not tasks:
             return queries, self._mock_results(entity_name, question), "mock"
 
-        results = await self._search_tavily(queries)
-        if not results:
+        all_results_lists = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Flatten and merge
+        merged: list[dict] = []
+        for result in all_results_lists:
+            if isinstance(result, Exception):
+                logger.warning("Scraper task failed: %s", result)
+                continue
+            if isinstance(result, list):
+                merged.extend(result)
+
+        if not merged:
             return queries, self._mock_results(entity_name, question), "mock"
-        return queries, results, "live"
+
+        # Deduplicate by URL
+        seen: set[str] = set()
+        unique: list[dict] = []
+        for item in merged:
+            url = item.get("url", "")
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            unique.append(item)
+
+        return queries, unique[:30], "live"
+
+    async def _search_platforms(self, entity_name: str) -> list[dict]:
+        """Run all platform-specific scrapers in parallel."""
+        from app.services.scrapers.ptt_scraper import search_ptt
+        from app.services.scrapers.dcard_scraper import search_dcard
+        from app.services.scrapers.facebook_scraper_service import search_facebook
+        from app.services.scrapers.google_maps_scraper import search_google_maps
+
+        fb_page_ids = None
+        if self.settings.facebook_page_ids:
+            fb_page_ids = [p.strip() for p in self.settings.facebook_page_ids.split(",") if p.strip()]
+
+        scraper_tasks = [
+            asyncio.create_task(search_ptt(entity_name, max_results=8)),
+            asyncio.create_task(search_dcard(entity_name, max_results=8)),
+            asyncio.create_task(search_facebook(
+                entity_name,
+                page_ids=fb_page_ids,
+                max_results=5,
+                cookies_path=self.settings.facebook_cookies_path,
+            )),
+            asyncio.create_task(search_google_maps(
+                entity_name,
+                serpapi_key=self.settings.serpapi_api_key,
+                max_results=8,
+            )),
+        ]
+
+        results_lists = await asyncio.gather(*scraper_tasks, return_exceptions=True)
+
+        merged: list[dict] = []
+        for result in results_lists:
+            if isinstance(result, Exception):
+                logger.warning("Platform scraper failed: %s", result)
+                continue
+            if isinstance(result, list):
+                merged.extend(result)
+
+        return merged
 
     async def _search_tavily(self, queries: list[str]) -> list[dict]:
         aggregated: list[dict] = []
