@@ -4,6 +4,8 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+.dev-logs/
+.dev-tools/
 
 frontend/node_modules/
 frontend/dist/
@@ -13,3 +15,4 @@ backend/.venv/
 backend/.mypy_cache/
 backend/.ruff_cache/
 backend/data/
+backend/static/

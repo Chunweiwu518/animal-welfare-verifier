@@ -594,6 +594,11 @@
   border-bottom-color: #0d7c5f;
 }
 
+.ptab.disabled {
+  color: #c0c4c8;
+  cursor: default;
+}
+
 .filter-bar {
   display: flex;
   flex-wrap: wrap;

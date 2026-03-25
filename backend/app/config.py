@@ -6,8 +6,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     app_name: str = "Animal Welfare Verifier API"
     app_env: str = "development"
-    frontend_origin: str = "http://localhost:5173"
+    frontend_origin: str = "http://localhost:9488"
     cors_allow_origins: str = "*"
+    frontend_dist_dir: str = "static"
     database_path: str = "data/animal_welfare_verifier.db"
     tavily_api_key: str | None = None
     openai_api_key: str | None = None

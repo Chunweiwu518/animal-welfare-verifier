@@ -109,6 +109,27 @@ const COMMON_QUESTIONS = [
 
 const PLATFORM_LABELS = ['Google 評論', 'Facebook', 'Instagram', 'Threads', 'Dcard', 'PTT', '新聞']
 
+type PlatformTab = '本平台' | typeof PLATFORM_LABELS[number]
+
+function matchPlatform(card: EvidenceCard, platform: PlatformTab): boolean {
+  if (platform === '本平台') return true
+  const src = (card.source + ' ' + card.url).toLowerCase()
+  switch (platform) {
+    case 'Google 評論': return src.includes('google') || src.includes('maps')
+    case 'Facebook': return src.includes('facebook') || src.includes('fb.com')
+    case 'Instagram': return src.includes('instagram') || src.includes('ig')
+    case 'Threads': return src.includes('threads')
+    case 'Dcard': return src.includes('dcard')
+    case 'PTT': return src.includes('ptt')
+    case '新聞': return card.source_type === 'news'
+    default: return true
+  }
+}
+
+function countPlatformCards(cards: EvidenceCard[], platform: PlatformTab): number {
+  return cards.filter((c) => matchPlatform(c, platform)).length
+}
+
 function getModeLabel(mode: SearchResponse['mode'] | null) {
   if (mode === 'live') {
     return '即時搜尋'
@@ -185,17 +206,6 @@ function getRecencyLabel(recency: EvidenceCard['recency_label']) {
       return '較舊'
     case 'unknown':
       return '未取得'
-  }
-}
-
-function getDuplicateRiskLabel(risk: EvidenceCard['duplicate_risk']) {
-  switch (risk) {
-    case 'low':
-      return '低'
-    case 'medium':
-      return '中'
-    case 'high':
-      return '高'
   }
 }
 
@@ -347,10 +357,6 @@ function getFakePlatformReviewCount(cards: EvidenceCard[]) {
   return cards.reduce((total, card) => total + Math.max(1, Math.round(card.credibility_score / 18)), 0)
 }
 
-function getGalleryCards(cards: EvidenceCard[]) {
-  return cards.slice(0, 5)
-}
-
 function getIntroParagraph(result: SearchResponse) {
   const firstSupporting = result.summary.supporting_points[0]
   const firstOpposing = result.summary.opposing_points[0]
@@ -398,6 +404,7 @@ function App() {
   const [profile, setProfile] = useState<EntityProfileResponse | null>(null)
   const [entityOptions, setEntityOptions] = useState<EntityListItem[]>([])
   const [activeFilter, setActiveFilter] = useState<ReviewFilter>('全部')
+  const [activePlatform, setActivePlatform] = useState<PlatformTab>('本平台')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const resultSectionRef = useRef<HTMLElement | null>(null)
@@ -411,9 +418,9 @@ function App() {
 
   const reviewFilters: ReviewFilter[] = ['全部', '最新', '支持疑慮', '反駁疑慮', '官方', '新聞', '論壇', '社群']
   const sourceTypeSummary = result ? buildSourceTypeSummary(result.evidence_cards) : []
-  const visibleCards = result ? filterEvidenceCards(activeFilter, result.evidence_cards) : []
+  const platformCards = result ? result.evidence_cards.filter((c) => matchPlatform(c, activePlatform)) : []
+  const visibleCards = result ? filterEvidenceCards(activeFilter, platformCards) : []
   const overallScore = result ? getOverallScore(result, profile) : 0
-  const galleryCards = result ? getGalleryCards(result.evidence_cards) : []
   const metricBars = result ? getMetricBars(result.evidence_cards, overallScore) : []
 
   useEffect(() => {
@@ -464,6 +471,7 @@ function App() {
       const data: SearchResponse = await response.json()
       setResult(data)
       setActiveFilter('全部')
+      setActivePlatform('本平台')
 
       const profileResponse = await fetch(
         `${API_BASE_URL}/api/entities/${encodeURIComponent(entityName)}/profile`,
@@ -795,14 +803,26 @@ function App() {
               </div>
 
               <div className="platform-tabs">
-                <button type="button" className="ptab active">
+                <button
+                  type="button"
+                  className={`ptab${activePlatform === '本平台' ? ' active' : ''}`}
+                  onClick={() => setActivePlatform('本平台')}
+                >
                   本平台 ({result.evidence_cards.length})
                 </button>
-                {PLATFORM_LABELS.map((label) => (
-                  <button key={label} type="button" className="ptab">
-                    {label}
-                  </button>
-                ))}
+                {PLATFORM_LABELS.map((label) => {
+                  const count = countPlatformCards(result.evidence_cards, label)
+                  return (
+                    <button
+                      key={label}
+                      type="button"
+                      className={`ptab${activePlatform === label ? ' active' : ''}${count === 0 ? ' disabled' : ''}`}
+                      onClick={() => setActivePlatform(label)}
+                    >
+                      {label}{count > 0 ? ` (${count})` : ''}
+                    </button>
+                  )
+                })}
               </div>
 
               <div className="filter-bar">
@@ -813,7 +833,7 @@ function App() {
                     className={`filter-chip${activeFilter === filter ? ' active' : ''}`}
                     onClick={() => setActiveFilter(filter)}
                   >
-                    {filter} ({getFilterCount(filter, result.evidence_cards)})
+                    {filter} ({getFilterCount(filter, platformCards)})
                   </button>
                 ))}
               </div>
