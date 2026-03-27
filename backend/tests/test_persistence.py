@@ -161,3 +161,30 @@ def test_persistence_service_lists_entities(tmp_path: Path) -> None:
     assert len(response.items) == 1
     assert response.items[0].entity_name == "台北市立動物園"
     assert "木柵動物園" in response.items[0].aliases
+
+
+def test_persistence_service_caches_and_reads_raw_sources(tmp_path: Path) -> None:
+    db_path = tmp_path / "test_cache.db"
+    settings = Settings(database_path=str(db_path))
+    service = PersistenceService(settings)
+    service.initialize()
+
+    cached_count = service.cache_raw_sources(
+        [
+            {
+                "title": "快取來源",
+                "url": "https://example.org/cache",
+                "content": "這是已快取的原始內容",
+                "source": "Example",
+                "source_type": "news",
+                "published_date": "2026-03-26",
+                "fetched_at": "2026-03-27T00:00:00+00:00",
+            }
+        ]
+    )
+
+    cached = service.get_sources_by_urls(["https://example.org/cache"])
+
+    assert cached_count == 1
+    assert cached["https://example.org/cache"]["title"] == "快取來源"
+    assert cached["https://example.org/cache"]["content"] == "這是已快取的原始內容"

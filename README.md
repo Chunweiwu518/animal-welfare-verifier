@@ -11,8 +11,9 @@ Search-first reputation and evidence platform for animal-related organizations o
 ## What this MVP does
 
 - accepts an entity name and a targeted question
-- expands the query into multiple search phrases
-- searches the web with Tavily when configured
+- expands the query into multiple review-focused search phrases
+- searches the web with Firecrawl when configured
+- supplements Taiwan forum reputation signals with PTT
 - falls back to mock evidence when no API key is present
 - classifies evidence into supporting, opposing, or neutral cards
 - generates a balanced summary with confidence and follow-up suggestions
@@ -73,8 +74,9 @@ PORT=9487 ~/.local/bin/uv run uvicorn app.main:app --host 0.0.0.0 --port 9487
 
 ## API Keys
 
-- `TAVILY_API_KEY`: required for live web search
+- `FIRECRAWL_API_KEY`: required for live web search
 - `OPENAI_API_KEY`: optional for richer balanced summaries
+- `SERPAPI_API_KEY`: optional for stronger Google Maps / Google Reviews results
 
 ## Suggested Service Ports
 

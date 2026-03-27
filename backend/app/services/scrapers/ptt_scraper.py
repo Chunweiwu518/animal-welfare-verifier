@@ -7,6 +7,7 @@ PTT Web 版是簡單的 HTML，只需帶 cookie over18=1 即可存取。
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timezone
 from urllib.parse import quote, urljoin
 
@@ -22,7 +23,8 @@ HEADERS = {
 }
 
 # Boards most relevant to animal welfare discussions
-BOARDS = ["Gossiping", "pet", "AnimalRight", "WomenTalk", "Lifeismoney"]
+BOARDS = ["pet", "dog", "cat", "AnimalForest", "AnimalRight", "Gossiping", "WomenTalk"]
+COMMON_SUFFIXES = ("狗園", "流浪狗園", "協會", "園區", "動保", "毛小孩")
 
 
 async def search_ptt(entity_name: str, max_results: int = 10) -> list[dict]:
@@ -49,53 +51,58 @@ async def search_ptt(entity_name: str, max_results: int = 10) -> list[dict]:
             if len(results) >= max_results:
                 break
             try:
-                search_url = f"{PTT_BASE}/bbs/{board}/search?q={quote(entity_name)}"
-                resp = await client.get(search_url)
-                if resp.status_code != 200:
-                    continue
-
-                soup = BeautifulSoup(resp.text, "html.parser")
-                entries = soup.select("div.r-ent")
-
-                for entry in entries[:5]:
+                for keyword in _build_search_keywords(entity_name):
                     if len(results) >= max_results:
                         break
-
-                    title_tag = entry.select_one("div.title a")
-                    if not title_tag:
+                    search_url = f"{PTT_BASE}/bbs/{board}/search?q={quote(keyword)}"
+                    resp = await client.get(search_url)
+                    if resp.status_code != 200:
                         continue
 
-                    title = title_tag.get_text(strip=True)
-                    href = title_tag.get("href", "")
-                    post_url = urljoin(PTT_BASE, href)
+                    soup = BeautifulSoup(resp.text, "html.parser")
+                    entries = soup.select("div.r-ent")
 
-                    # Get date
-                    date_tag = entry.select_one("div.date")
-                    date_str = date_tag.get_text(strip=True) if date_tag else ""
+                    for entry in entries[:5]:
+                        if len(results) >= max_results:
+                            break
 
-                    # Get push count
-                    push_tag = entry.select_one("div.nrec span")
-                    push_count = push_tag.get_text(strip=True) if push_tag else "0"
+                        title_tag = entry.select_one("div.title a")
+                        if not title_tag:
+                            continue
 
-                    # Fetch article content (first 500 chars)
-                    content = await _fetch_article_content(client, post_url, BeautifulSoup)
+                        title = title_tag.get_text(strip=True)
+                        href = title_tag.get("href", "")
+                        post_url = urljoin(PTT_BASE, href)
 
-                    results.append({
-                        "title": f"[PTT/{board}] {title}",
-                        "url": post_url,
-                        "content": content,
-                        "source": f"PTT {board}",
-                        "source_type": "forum",
-                        "published_date": _parse_ptt_date(date_str),
-                        "fetched_at": now,
-                        "push_count": push_count,
-                        "platform": "ptt",
-                    })
+                        if not _matches_entity(title, entity_name):
+                            continue
+
+                        date_tag = entry.select_one("div.date")
+                        date_str = date_tag.get_text(strip=True) if date_tag else ""
+
+                        push_tag = entry.select_one("div.nrec span")
+                        push_count = push_tag.get_text(strip=True) if push_tag else "0"
+
+                        content = await _fetch_article_content(client, post_url, BeautifulSoup)
+                        if content and not _matches_entity(content, entity_name):
+                            continue
+
+                        results.append({
+                            "title": f"[PTT/{board}] {title}",
+                            "url": post_url,
+                            "content": content,
+                            "source": f"PTT {board}",
+                            "source_type": "forum",
+                            "published_date": _parse_ptt_date(date_str),
+                            "fetched_at": now,
+                            "push_count": push_count,
+                            "platform": "ptt",
+                        })
             except Exception as exc:
                 logger.warning("PTT scrape error for board %s: %s", board, exc)
                 continue
 
-    return results
+    return _deduplicate_results(results)[:max_results]
 
 
 async def _fetch_article_content(
@@ -141,3 +148,48 @@ def _parse_ptt_date(date_str: str) -> str | None:
     except (ValueError, IndexError):
         return None
 
+
+def _build_search_keywords(entity_name: str) -> list[str]:
+    normalized = entity_name.strip()
+    tokens = [token for token in re.split(r"[\s　]+", normalized) if token]
+    keywords = [normalized]
+
+    for token in tokens:
+        if len(token) >= 2:
+            keywords.append(token)
+
+    for suffix in COMMON_SUFFIXES:
+        if suffix not in normalized:
+            keywords.append(f"{normalized}{suffix}")
+
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for keyword in keywords:
+        value = keyword.strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        ordered.append(value)
+    return ordered[:6]
+
+
+def _matches_entity(text: str, entity_name: str) -> bool:
+    normalized_text = text.lower()
+    for keyword in _build_search_keywords(entity_name):
+        normalized_keyword = keyword.lower()
+        if len(normalized_keyword) >= 2 and normalized_keyword in normalized_text:
+            return True
+    tokens = [token.lower() for token in re.split(r"[\s　]+", entity_name) if token.strip()]
+    return any(len(token) >= 2 and token in normalized_text for token in tokens)
+
+
+def _deduplicate_results(results: list[dict]) -> list[dict]:
+    seen_urls: set[str] = set()
+    deduped: list[dict] = []
+    for result in results:
+        url = str(result.get("url") or "").strip()
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        deduped.append(result)
+    return deduped

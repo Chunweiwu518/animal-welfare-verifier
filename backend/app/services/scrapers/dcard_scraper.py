@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from time import monotonic
 
 import httpx
 
@@ -21,6 +22,9 @@ HEADERS = {
     "Referer": "https://www.dcard.tw/",
 }
 
+_FORBIDDEN_COOLDOWN_SECONDS = 60 * 60
+_last_forbidden_at: float | None = None
+
 
 async def search_dcard(entity_name: str, max_results: int = 10) -> list[dict]:
     """Search Dcard for posts mentioning the entity.
@@ -29,6 +33,11 @@ async def search_dcard(entity_name: str, max_results: int = 10) -> list[dict]:
     """
     results: list[dict] = []
     now = datetime.now(timezone.utc).isoformat()
+    global _last_forbidden_at
+
+    if _last_forbidden_at is not None and (monotonic() - _last_forbidden_at) < _FORBIDDEN_COOLDOWN_SECONDS:
+        logger.info("Dcard scraper cooling down after recent 403; skipping direct request")
+        return []
 
     async with httpx.AsyncClient(
         timeout=15.0,
@@ -39,7 +48,11 @@ async def search_dcard(entity_name: str, max_results: int = 10) -> list[dict]:
             search_url = f"{DCARD_API}/search/posts"
             resp = await client.get(search_url, params={"query": entity_name, "limit": max_results})
             if resp.status_code != 200:
-                logger.warning("Dcard search returned status %d", resp.status_code)
+                if resp.status_code == 403:
+                    _last_forbidden_at = monotonic()
+                    logger.info("Dcard direct API blocked with 403; rely on search-engine indexed Dcard pages instead")
+                else:
+                    logger.warning("Dcard search returned status %d", resp.status_code)
                 return []
 
             posts = resp.json()
@@ -101,4 +114,3 @@ async def _fetch_post_content(client: httpx.AsyncClient, post_id: int) -> str | 
         return data.get("content", "") or data.get("excerpt", "")
     except Exception:
         return None
-

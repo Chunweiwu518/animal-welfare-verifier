@@ -181,6 +181,91 @@ class PersistenceService:
             connection.commit()
             return query_id
 
+    def cache_raw_sources(self, raw_results: list[dict]) -> int:
+        cached_count = 0
+        with self._connect() as connection:
+            for item in raw_results:
+                url = str(item.get("url") or "").strip()
+                if not url:
+                    continue
+                connection.execute(
+                    """
+                    INSERT INTO sources (
+                        url,
+                        domain,
+                        site_name,
+                        source_type,
+                        author,
+                        published_at,
+                        fetched_at,
+                        raw_title,
+                        raw_content
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(url) DO UPDATE SET
+                        domain = excluded.domain,
+                        site_name = COALESCE(NULLIF(excluded.site_name, ''), site_name),
+                        source_type = COALESCE(NULLIF(excluded.source_type, ''), source_type),
+                        author = COALESCE(NULLIF(excluded.author, ''), author),
+                        published_at = COALESCE(excluded.published_at, published_at),
+                        fetched_at = COALESCE(excluded.fetched_at, fetched_at),
+                        raw_title = COALESCE(NULLIF(excluded.raw_title, ''), raw_title),
+                        raw_content = COALESCE(NULLIF(excluded.raw_content, ''), raw_content),
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (
+                        url,
+                        self._domain_from_url(url),
+                        str(item.get("source") or self._domain_from_url(url)),
+                        str(item.get("source_type") or "other"),
+                        str(item.get("author") or "") or None,
+                        item.get("published_date"),
+                        item.get("fetched_at"),
+                        str(item.get("title") or ""),
+                        str(item.get("content") or item.get("raw_content") or item.get("snippet") or ""),
+                    ),
+                )
+                cached_count += 1
+
+            connection.commit()
+        return cached_count
+
+    def get_sources_by_urls(self, urls: list[str]) -> dict[str, dict[str, str | None]]:
+        normalized_urls = [url.strip() for url in urls if url.strip()]
+        if not normalized_urls:
+            return {}
+
+        placeholders = ",".join("?" for _ in normalized_urls)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT
+                    url,
+                    site_name,
+                    source_type,
+                    author,
+                    published_at,
+                    fetched_at,
+                    raw_title,
+                    raw_content
+                FROM sources
+                WHERE url IN ({placeholders})
+                """,
+                normalized_urls,
+            ).fetchall()
+
+        return {
+            str(row["url"]): {
+                "source": str(row["site_name"]) if row["site_name"] is not None else None,
+                "source_type": str(row["source_type"]) if row["source_type"] is not None else None,
+                "author": str(row["author"]) if row["author"] is not None else None,
+                "published_date": str(row["published_at"]) if row["published_at"] is not None else None,
+                "fetched_at": str(row["fetched_at"]) if row["fetched_at"] is not None else None,
+                "title": str(row["raw_title"]) if row["raw_title"] is not None else None,
+                "content": str(row["raw_content"]) if row["raw_content"] is not None else None,
+            }
+            for row in rows
+        }
+
     def get_entity_profile(self, entity_name: str) -> EntityProfileResponse | None:
         with self._connect() as connection:
             entity_row = self._find_entity_by_name_or_alias(connection, entity_name)

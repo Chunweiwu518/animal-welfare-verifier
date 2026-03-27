@@ -3,152 +3,371 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 import httpx
 from trafilatura.metadata import extract_metadata
 
 from app.config import Settings
+from app.services.firecrawl_service import FirecrawlService
+from app.services.persistence_service import PersistenceService
+from app.services.scrapers.google_maps_scraper import search_google_maps
+from app.services.scrapers.ptt_scraper import search_ptt
 
 logger = logging.getLogger(__name__)
 
+LOW_SIGNAL_SOCIAL_MARKERS = (
+    "log into facebook",
+    "sign up for facebook",
+    "explore the things you love",
+    "privacy policy",
+    "messenger",
+    "meta pay",
+    "ray-ban meta",
+    "create ad",
+    "about create ad",
+    "more languages",
+    "mentions facebook",
+    "paint0_linear",
+    "paint1_ra",
+    "userSpaceOnUse",
+    "stop-color",
+    "fill'url(%23",
+    "error 403",
+    "that’s an error",
+    "播放影片",
+    "current time 0:00",
+    "stream type live",
+    "skip navigation",
+)
+
+EMPTY_CONTENT_MARKERS = (
+    "目前沒有可用的摘要內容",
+    "目前沒有可用的相關段落",
+    "no summary available",
+)
+
 
 class SearchService:
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, persistence_service: PersistenceService | None = None):
         self.settings = settings
+        self.persistence_service = persistence_service
+        self.firecrawl_service = FirecrawlService(settings)
+
+    def _bounded_limit(self, value: int, *, default: int, minimum: int = 1, maximum: int = 500) -> int:
+        if value < minimum:
+            return default
+        return min(value, maximum)
+
+    def _metadata_enrich_limit(self) -> int:
+        return self._bounded_limit(self.settings.metadata_enrich_limit, default=24, maximum=100)
+
+    def _metadata_enrich_concurrency(self) -> int:
+        return self._bounded_limit(self.settings.metadata_enrich_concurrency, default=6, maximum=20)
 
     def build_queries(self, entity_name: str, question: str) -> list[str]:
-        base = entity_name.strip()
-        normalized_question = question.strip()
-        return [
-            f"{base} {normalized_question}",
-            f"{base} 評價",
-            f"{base} 爭議",
-            f"{base} 新聞",
-            f"{base} 動物福利",
+        variants = self._expand_entity_variants(entity_name)
+        templates = [
+            "{base} 評論",
+            "{base} 評價",
+            "{base} 心得",
+            "{base} 口碑",
+            "{base} 推薦 不推",
+            "{base} 好評 負評",
+            "{base} Google 評論",
+            "{base} PTT",
+            "{base} Dcard",
+            "{base} Facebook 評價",
+            "{base} Instagram",
+            "{base} Threads",
+            "site:dcard.tw {base}",
+            "site:facebook.com {base}",
+            "site:instagram.com {base}",
+            "site:threads.net {base}",
+            "site:ptt.cc/bbs {base}",
+            "site:maps.google.com {base}",
+            "\"{base}\" Google 評論",
+            "\"{base}\" PTT",
         ]
+        candidate_queries: list[str] = []
+        for template in templates:
+            for base in variants:
+                candidate_queries.append(template.format(base=base))
+
+        unique_queries: list[str] = []
+        seen: set[str] = set()
+        for query in candidate_queries:
+            normalized = query.strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            unique_queries.append(normalized)
+        return unique_queries
+
+    def _expand_entity_variants(self, entity_name: str) -> list[str]:
+        base = entity_name.strip()
+        variants = [base]
+        if base.endswith("狗園"):
+            root = base.removesuffix("狗園").strip()
+            variants.extend(
+                [
+                    f"{root}寵物樂園",
+                    f"{root}樂園",
+                    f"{root}園區",
+                ]
+            )
+        if base.endswith("樂園"):
+            root = base.removesuffix("樂園").strip()
+            variants.extend([f"{root}狗園", f"{root}寵物樂園"])
+
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for variant in variants:
+            value = variant.strip()
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            ordered.append(value)
+        return ordered[:4]
 
     async def search(self, entity_name: str, question: str) -> tuple[list[str], list[dict], str]:
         queries = self.build_queries(entity_name, question)
+        result_limit = self._bounded_limit(self.settings.search_result_limit, default=100, maximum=500)
 
-        # Run all scrapers in parallel
-        tasks: list[asyncio.Task] = []
-
-        # Tavily (Google search proxy)
-        if self.settings.tavily_api_key:
-            tasks.append(asyncio.create_task(self._search_tavily(queries)))
-
-        # Platform-specific scrapers
-        tasks.append(asyncio.create_task(self._search_platforms(entity_name)))
-
-        if not tasks:
-            return queries, self._mock_results(entity_name, question), "mock"
-
-        all_results_lists = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Flatten and merge
         merged: list[dict] = []
-        for result in all_results_lists:
-            if isinstance(result, Exception):
-                logger.warning("Scraper task failed: %s", result)
-                continue
-            if isinstance(result, list):
-                merged.extend(result)
+        if self.settings.firecrawl_api_key:
+            try:
+                merged = await self.firecrawl_service.search_reviews(queries)
+            except Exception as exc:
+                logger.warning("Firecrawl search failed: %s", exc)
+                merged = []
+
+        platform_results = await self._search_platform_sources(entity_name)
+        merged.extend(platform_results)
 
         if not merged:
             return queries, self._mock_results(entity_name, question), "mock"
 
-        # Deduplicate by URL
-        seen: set[str] = set()
-        unique: list[dict] = []
-        for item in merged:
-            url = item.get("url", "")
-            if not url or url in seen:
+        unique = self._deduplicate_by_url(merged)
+        unique = self._hydrate_cached_sources(unique)
+        unique = self._filter_low_signal_results(unique, entity_name)
+        unique = self._filter_to_review_sources(unique, entity_name)
+        unique = self._prioritize_review_results(unique, entity_name)
+        if not unique:
+            return queries, self._mock_results(entity_name, question), "mock"
+        return queries, unique[:result_limit], "live"
+
+    def _filter_to_review_sources(self, items: list[dict], entity_name: str) -> list[dict]:
+        filtered: list[dict] = []
+        entity_lower = entity_name.lower().strip()
+        review_markers = ("評論", "評價", "心得", "推薦", "不推", "好評", "負評", "留言", "reviews", "review", "star", "評分")
+        social_hosts = ("facebook.com", "instagram.com", "threads.net", "dcard.tw", "ptt.cc", "google.com", "maps.google.com")
+        for item in items:
+            url = str(item.get("url") or "").lower()
+            title = str(item.get("title") or "").lower()
+            text = str(item.get("content") or item.get("snippet") or "").lower()
+            haystack = f"{title} {text}"
+            host_match = any(marker in url for marker in social_hosts)
+            review_match = any(marker in haystack for marker in review_markers)
+            entity_match = entity_lower in haystack or entity_lower in url
+            has_meaningful_text = len(text.strip()) >= 40 and not any(marker in haystack for marker in EMPTY_CONTENT_MARKERS)
+            if host_match and entity_match and has_meaningful_text:
+                filtered.append(item)
                 continue
-            seen.add(url)
-            unique.append(item)
+            if review_match and entity_match:
+                filtered.append(item)
+        return filtered or items
 
-        return queries, unique[:30], "live"
+    def _prioritize_review_results(self, items: list[dict], entity_name: str) -> list[dict]:
+        entity_lower = entity_name.lower().strip()
+        review_markers = ("評論", "評價", "心得", "推薦", "不推", "好評", "負評", "留言", "星等", "評分", "review", "reviews")
 
-    async def _search_platforms(self, entity_name: str) -> list[dict]:
-        """Run all platform-specific scrapers in parallel."""
-        from app.services.scrapers.ptt_scraper import search_ptt
-        from app.services.scrapers.dcard_scraper import search_dcard
-        from app.services.scrapers.facebook_scraper_service import search_facebook
-        from app.services.scrapers.google_maps_scraper import search_google_maps
+        def rank(item: dict) -> tuple[int, int, int]:
+            url = str(item.get("url") or "").lower()
+            title = str(item.get("title") or "").lower()
+            text = str(item.get("content") or item.get("snippet") or "").lower()
+            source = str(item.get("source") or "").lower()
+            haystack = f"{title} {text} {source}"
+            platform_bonus = 0
+            if "ptt.cc" in url:
+                platform_bonus = 5
+            elif "google.com/maps" in url or "maps.google" in url:
+                platform_bonus = 4
+            elif "dcard.tw" in url:
+                platform_bonus = 4
+            elif any(host in url for host in ("facebook.com", "instagram.com", "threads.net")):
+                platform_bonus = 2
+            elif "news" in source or "新聞" in source:
+                platform_bonus = 1
 
-        fb_page_ids = None
-        if self.settings.facebook_page_ids:
-            fb_page_ids = [p.strip() for p in self.settings.facebook_page_ids.split(",") if p.strip()]
+            review_hits = sum(1 for marker in review_markers if marker in haystack)
+            entity_hit = int(entity_lower in haystack or entity_lower in url)
+            text_quality = min(len(text.strip()), 500)
+            return (entity_hit * 10 + review_hits + platform_bonus, review_hits, text_quality)
 
-        scraper_tasks = [
-            asyncio.create_task(search_ptt(entity_name, max_results=8)),
-            asyncio.create_task(search_dcard(entity_name, max_results=8)),
-            asyncio.create_task(search_facebook(
+        return sorted(items, key=rank, reverse=True)
+
+    async def _search_platform_sources(self, entity_name: str) -> list[dict]:
+        tasks = [
+            search_ptt(
                 entity_name,
-                page_ids=fb_page_ids,
-                max_results=5,
-                cookies_path=self.settings.facebook_cookies_path,
-            )),
-            asyncio.create_task(search_google_maps(
+                max_results=self._bounded_limit(self.settings.ptt_max_results, default=20, maximum=50),
+            ),
+            search_google_maps(
                 entity_name,
                 serpapi_key=self.settings.serpapi_api_key,
-                max_results=8,
-            )),
+                max_results=self._bounded_limit(self.settings.google_maps_max_results, default=20, maximum=50),
+            ),
         ]
-
-        results_lists = await asyncio.gather(*scraper_tasks, return_exceptions=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
         merged: list[dict] = []
-        for result in results_lists:
+        for result in results:
             if isinstance(result, Exception):
-                logger.warning("Platform scraper failed: %s", result)
+                logger.warning("Platform search failed: %s", result)
                 continue
-            if isinstance(result, list):
-                merged.extend(result)
-
+            merged.extend(result)
         return merged
 
-    async def _search_tavily(self, queries: list[str]) -> list[dict]:
-        aggregated: list[dict] = []
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            for query in queries[:3]:
-                response = await client.post(
-                    "https://api.tavily.com/search",
-                    json={
-                        "api_key": self.settings.tavily_api_key,
-                        "query": query,
-                        "search_depth": "advanced",
-                        "max_results": 5,
-                        "include_answer": False,
-                        "include_raw_content": True,
-                    },
-                )
-                response.raise_for_status()
-                payload = response.json()
-                aggregated.extend(payload.get("results", []))
-
-            enriched_results = []
-            for item in aggregated:
-                enriched_results.append(await self._enrich_result(item, client))
-
-        seen: set[str] = set()
-        unique_results = []
-        for item in enriched_results:
-            url = item.get("url")
-            if not url or url in seen:
+    def _deduplicate_by_url(self, items: list[dict]) -> list[dict]:
+        seen_urls: set[str] = set()
+        seen_signatures: set[str] = set()
+        unique_items: list[dict] = []
+        for item in items:
+            url = str(item.get("url") or "").strip()
+            title = str(item.get("title") or "").strip().lower()
+            host = urlparse(url).netloc.lower()
+            signature = f"{host}|{title[:80]}"
+            if not url or url in seen_urls or (title and signature in seen_signatures):
                 continue
-            seen.add(url)
-            unique_results.append(item)
-        return unique_results[:10]
+            seen_urls.add(url)
+            if title:
+                seen_signatures.add(signature)
+            unique_items.append(item)
+        return unique_items
 
-    async def _enrich_result(self, item: dict, client: httpx.AsyncClient) -> dict:
+    def _filter_low_signal_results(self, items: list[dict], entity_name: str) -> list[dict]:
+        return [item for item in items if not self._is_low_signal_result(item, entity_name)]
+
+    def _is_low_signal_result(self, item: dict, entity_name: str) -> bool:
+        url = str(item.get("url") or "").strip()
+        if not url:
+            return True
+
+        parsed = urlparse(url)
+        host = parsed.netloc.lower()
+        path = parsed.path.lower().strip("/")
+        title = str(item.get("title") or "").strip().lower()
+        text = str(item.get("content") or item.get("snippet") or "").strip().lower()
+        combined = f"{title} {text}"
+        entity_tokens = [variant.lower() for variant in self._expand_entity_variants(entity_name)]
+        entity_match = any(token and (token in combined or token in url.lower()) for token in entity_tokens)
+        social_host = any(marker in host for marker in ("facebook.com", "instagram.com", "threads.net"))
+        profile_like_path = path.count("/") <= 1 and not any(marker in path for marker in ("posts", "p/", "reel", "videos", "photos"))
+        has_meaningful_text = len(text) >= 10 and not any(marker in text for marker in EMPTY_CONTENT_MARKERS)
+
+        if any(marker in combined for marker in LOW_SIGNAL_SOCIAL_MARKERS):
+            return True
+
+        if any(marker in url.lower() for marker in ("pttweb.cc", "/search?q=thread", "/bbs/")) and "ptt.cc" not in host:
+            return True
+
+        if any(marker in combined for marker in ("文章列表", "精華區", "search?q=thread", "latest all comments")):
+            return True
+
+        if "facebook.com" in host and (not path or path in {"login", "pages", "watch", "groups"}):
+            return True
+
+        if "instagram.com" in host and (not path or path in {"", "accounts", "explore", "direct"}):
+            return True
+
+        if "threads.net" in host and not entity_match and (not path or path in {"", "login"}):
+            return True
+
+        if ("facebook.com" in host or "instagram.com" in host or "threads.net" in host) and not entity_match:
+            if any(marker in combined for marker in ("privacy", "meta", "sign up", "log in", "login")):
+                return True
+
+        if any(marker in combined for marker in ("paint0_linear", "paint1_ra", "userspaceonuse", "stop-color", "fill'url(%23")):
+            return True
+
+        if social_host and (profile_like_path or not has_meaningful_text):
+            return True
+
+        if "facebook.com" in host and "posts" not in path and "permalink" not in path and "share" not in path:
+            return True
+
+        if "youtube.com" in host and any(marker in combined for marker in ("error 403", "that’s an error", "skip navigation")):
+            return True
+
+        return False
+
+    async def _enrich_results(
+        self,
+        items: list[dict],
+        client: httpx.AsyncClient,
+        cached_sources: dict[str, dict[str, str | None]],
+    ) -> list[dict]:
+        enrich_limit = self._metadata_enrich_limit()
+        semaphore = asyncio.Semaphore(self._metadata_enrich_concurrency())
+        remaining_slots = enrich_limit
+        tasks: list[asyncio.Task[dict]] = []
+        passthrough: list[dict | None] = [None] * len(items)
+
+        async def run(item: dict, cached_source: dict[str, str | None] | None) -> dict:
+            async with semaphore:
+                return await self._enrich_result(item, client, cached_source=cached_source)
+
+        for index, item in enumerate(items):
+            url = str(item.get("url") or "").strip()
+            cached_source = cached_sources.get(url)
+            hydrated_item = self._merge_cached_source(item, cached_source or {}) if cached_source else dict(item)
+            needs_network_enrich = self._needs_network_enrich(hydrated_item)
+            if needs_network_enrich and remaining_slots > 0:
+                remaining_slots -= 1
+                tasks.append(asyncio.create_task(run(item, cached_source)))
+                continue
+            passthrough[index] = hydrated_item
+
+        if not tasks:
+            return [item for item in passthrough if item is not None]
+
+        task_results = await asyncio.gather(*tasks, return_exceptions=True)
+        result_iter = iter(task_results)
+        final_results: list[dict] = []
+        for item in passthrough:
+            if item is not None:
+                final_results.append(item)
+                continue
+            task_result = next(result_iter)
+            if isinstance(task_result, Exception):
+                logger.warning("Result enrichment failed: %s", task_result)
+                final_results.append({})
+                continue
+            final_results.append(task_result)
+        return [item for item in final_results if item]
+
+    async def _enrich_result(
+        self,
+        item: dict,
+        client: httpx.AsyncClient,
+        cached_source: dict[str, str | None] | None = None,
+    ) -> dict:
         enriched = dict(item)
+        if cached_source:
+            enriched = self._merge_cached_source(enriched, cached_source)
+
         enriched.setdefault("fetched_at", datetime.now(timezone.utc).isoformat())
         if enriched.get("published_date") and enriched.get("source"):
             return enriched
 
         url = enriched.get("url")
         if not url:
+            return enriched
+
+        has_usable_content = bool((enriched.get("content") or enriched.get("snippet") or "").strip())
+        has_usable_title = bool((enriched.get("title") or "").strip())
+        if has_usable_content and has_usable_title:
             return enriched
 
         try:
@@ -170,6 +389,55 @@ class SearchService:
         if not enriched.get("title") and getattr(metadata, "title", None):
             enriched["title"] = metadata.title
         return enriched
+
+    def _needs_network_enrich(self, item: dict) -> bool:
+        text = str(item.get("content") or item.get("snippet") or "").strip()
+        title = str(item.get("title") or "").strip()
+        source = str(item.get("source") or "").strip()
+        published_date = str(item.get("published_date") or "").strip()
+        return not (len(text) >= 140 and title and source and published_date)
+
+    def _load_cached_sources(self, items: list[dict]) -> dict[str, dict[str, str | None]]:
+        if self.persistence_service is None:
+            return {}
+        urls = [str(item.get("url") or "").strip() for item in items if str(item.get("url") or "").strip()]
+        return self.persistence_service.get_sources_by_urls(urls)
+
+    def _merge_cached_source(
+        self,
+        item: dict,
+        cached_source: dict[str, str | None],
+    ) -> dict:
+        merged = dict(item)
+        field_map = {
+            "source": "source",
+            "source_type": "source_type",
+            "author": "author",
+            "published_date": "published_date",
+            "fetched_at": "fetched_at",
+            "title": "title",
+            "content": "content",
+        }
+        for target_field, cache_field in field_map.items():
+            if merged.get(target_field):
+                continue
+            cached_value = cached_source.get(cache_field)
+            if cached_value:
+                merged[target_field] = cached_value
+        return merged
+
+    def _hydrate_cached_sources(self, items: list[dict]) -> list[dict]:
+        cached_sources = self._load_cached_sources(items)
+        if not cached_sources:
+            return items
+        return [
+            self._merge_cached_source(item, cached_sources.get(str(item.get("url") or "").strip(), {}))
+            for item in items
+        ]
+
+    def _domain_from_url(self, url: str) -> str:
+        parsed = urlparse(url)
+        return parsed.netloc or url
 
     def _mock_results(self, entity_name: str, question: str) -> list[dict]:
         now = datetime.now(timezone.utc).isoformat()

@@ -14,6 +14,8 @@ class EvidenceCard(BaseModel):
     source: str
     source_type: Literal["official", "news", "forum", "social", "other"]
     snippet: str
+    excerpt: str | None = None
+    ai_summary: str | None = None
     extracted_at: str | None = None
     published_at: str | None = None
     stance: Literal["supporting", "opposing", "neutral", "unclear"]

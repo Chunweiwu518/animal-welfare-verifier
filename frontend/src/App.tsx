@@ -22,6 +22,8 @@ type EvidenceCard = {
   source: string
   source_type: 'official' | 'news' | 'forum' | 'social' | 'other'
   snippet: string
+  excerpt?: string | null
+  ai_summary?: string | null
   extracted_at: string | null
   published_at: string | null
   stance: 'supporting' | 'opposing' | 'neutral' | 'unclear'
@@ -101,15 +103,29 @@ const DEFAULT_API_BASE_URL =
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? DEFAULT_API_BASE_URL
 
 const COMMON_QUESTIONS = [
-  '是否有動物照顧不當爭議？',
-  '是否有募資或財務不透明問題？',
-  '是否有官方回應與改善紀錄？',
   '近期評價是偏正面還是偏負面？',
+  '有哪些真實心得、推薦或不推薦？',
+  '最近是否有照護爭議或負評？',
+  'Google 與 PTT 上怎麼說？',
 ]
 
 const PLATFORM_LABELS = ['Google 評論', 'Facebook', 'Instagram', 'Threads', 'Dcard', 'PTT', '新聞']
+const SEARCH_SESSION_STORAGE_KEY = 'animal-welfare-search-session-v1'
+const SEARCH_PROGRESS_STEPS = [
+  '正在展開評論、評價、心得等查詢詞',
+  '正在整理 Firecrawl 與 PTT 的口碑來源',
+  '正在清洗內文並挑出可讀的評論摘錄',
+] as const
 
 type PlatformTab = '本平台' | typeof PLATFORM_LABELS[number]
+type SearchSessionState = {
+  entityName: string
+  question: string
+  result: SearchResponse | null
+  profile: EntityProfileResponse | null
+  activeFilter: ReviewFilter
+  activePlatform: PlatformTab
+}
 
 function matchPlatform(card: EvidenceCard, platform: PlatformTab): boolean {
   if (platform === '本平台') return true
@@ -132,11 +148,11 @@ function countPlatformCards(cards: EvidenceCard[], platform: PlatformTab): numbe
 
 function getModeLabel(mode: SearchResponse['mode'] | null) {
   if (mode === 'live') {
-    return '即時搜尋'
+    return '即時評論搜尋'
   }
 
   if (mode === 'mock') {
-    return '模擬資料'
+    return '示例資料'
   }
 
   return '待搜尋'
@@ -196,6 +212,23 @@ function getSourceTypeLabel(sourceType: EvidenceCard['source_type']) {
     case 'other':
       return '其他'
   }
+}
+
+function getPlatformLabel(card: EvidenceCard) {
+  const sourceText = `${card.source} ${card.url}`.toLowerCase()
+  if (sourceText.includes('dcard')) return 'Dcard'
+  if (sourceText.includes('ptt.cc') || sourceText.includes(' ptt')) return 'PTT'
+  if (sourceText.includes('facebook') || sourceText.includes('fb.com')) return 'Facebook'
+  if (sourceText.includes('instagram')) return 'Instagram'
+  if (sourceText.includes('threads.net') || sourceText.includes('threads')) return 'Threads'
+  if (sourceText.includes('google') || sourceText.includes('maps')) return 'Google'
+  if (card.source_type === 'news') return '新聞'
+  if (card.source_type === 'official') return '官方'
+  return '其他'
+}
+
+function getCardExcerpt(card: EvidenceCard) {
+  return card.excerpt?.trim() || card.snippet?.trim() || '目前沒有可用的相關段落。'
 }
 
 function getRecencyLabel(recency: EvidenceCard['recency_label']) {
@@ -354,25 +387,10 @@ function getReviewTone(cards: EvidenceCard[]) {
 }
 
 function getFakePlatformReviewCount(cards: EvidenceCard[]) {
-  return cards.reduce((total, card) => total + Math.max(1, Math.round(card.credibility_score / 18)), 0)
+  return cards.length
 }
 
 function getIntroParagraph(result: SearchResponse) {
-  const firstSupporting = result.summary.supporting_points[0]
-  const firstOpposing = result.summary.opposing_points[0]
-
-  if (firstSupporting && firstOpposing) {
-    return `${firstSupporting}；同時也有資料指出 ${firstOpposing}。目前較適合把它視為存在爭議、但仍需持續追蹤的對象。`
-  }
-
-  if (firstSupporting) {
-    return `${firstSupporting}。目前公開資訊以疑慮內容為主，建議補找官方回應與近期改善紀錄。`
-  }
-
-  if (firstOpposing) {
-    return `${firstOpposing}。目前公開資料偏向改善或緩和說法，但仍建議持續檢查是否有新的爭議。`
-  }
-
   return result.summary.verdict
 }
 
@@ -397,6 +415,57 @@ function getMetricBars(cards: EvidenceCard[], overallScore: number) {
   ]
 }
 
+function getEvidenceOriginLabel(card: EvidenceCard) {
+  if (card.source_type === 'official') {
+    return '官方說明'
+  }
+  if (card.first_hand_score >= 75) {
+    return '第一手描述'
+  }
+  if (card.source_type === 'news') {
+    return '新聞轉述'
+  }
+  if ((card.source_type === 'forum' || card.source_type === 'social') && card.first_hand_score >= 55) {
+    return '社群第一手貼文'
+  }
+  if (card.source_type === 'forum' || card.source_type === 'social') {
+    return '社群討論'
+  }
+  return '整理資料'
+}
+
+function getEvidenceOriginClassName(card: EvidenceCard) {
+  if (card.source_type === 'official') {
+    return 'origin-official'
+  }
+  if (card.first_hand_score >= 75) {
+    return 'origin-first-hand'
+  }
+  if (card.source_type === 'news') {
+    return 'origin-reported'
+  }
+  return 'origin-aggregated'
+}
+
+function getMetricDescription(label: string, value: number) {
+  switch (label) {
+    case '第一手程度':
+      if (value >= 70) return '多數來源帶有現場觀察、官方公告或直接敘述。'
+      if (value >= 45) return '目前以混合來源為主，包含部分轉述與間接說法。'
+      return '多數內容偏新聞轉述、訪談引述或二手整理，不能直接當成定論。'
+    case '相關性':
+      return value >= 70 ? '多數結果有直接提到查詢主體。' : '部分結果仍需要人工確認是否真的與主體直接相關。'
+    case '近期資訊比例':
+      return value >= 50 ? '近期資料比例足夠。' : '近期資料偏少，建議補抓近一年來源。'
+    default:
+      return value >= 70 ? '可作為主要參考，但仍應交叉驗證。' : '目前只適合作為初步線索。'
+  }
+}
+
+function buildStoredSession(state: SearchSessionState) {
+  return JSON.stringify(state)
+}
+
 function App() {
   const [entityName, setEntityName] = useState('某某動物園區')
   const [question, setQuestion] = useState('是否有募資不透明或動物福利爭議？')
@@ -407,6 +476,7 @@ function App() {
   const [activePlatform, setActivePlatform] = useState<PlatformTab>('本平台')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [searchStepIndex, setSearchStepIndex] = useState(0)
   const resultSectionRef = useRef<HTMLElement | null>(null)
 
   // Media upload state
@@ -424,8 +494,62 @@ function App() {
   const metricBars = result ? getMetricBars(result.evidence_cards, overallScore) : []
 
   useEffect(() => {
-    void loadEntityOptions('')
+    try {
+      const raw = window.sessionStorage.getItem(SEARCH_SESSION_STORAGE_KEY)
+      if (!raw) {
+        void loadEntityOptions('')
+        return
+      }
+
+      const restored = JSON.parse(raw) as SearchSessionState
+      setEntityName(restored.entityName)
+      setQuestion(restored.question)
+      setResult(restored.result)
+      setProfile(restored.profile)
+      setActiveFilter(restored.activeFilter)
+      setActivePlatform(restored.activePlatform)
+      void loadEntityOptions(restored.entityName)
+    } catch {
+      void loadEntityOptions('')
+    }
   }, [])
+
+  useEffect(() => {
+    try {
+      window.sessionStorage.setItem(
+        SEARCH_SESSION_STORAGE_KEY,
+        buildStoredSession({
+          entityName,
+          question,
+          result,
+          profile,
+          activeFilter,
+          activePlatform,
+        }),
+      )
+    } catch {
+      // Ignore storage failures on restricted browsers.
+    }
+  }, [activeFilter, activePlatform, entityName, profile, question, result])
+
+  useEffect(() => {
+    if (!loading) {
+      setSearchStepIndex(0)
+      return
+    }
+
+    const timer = window.setInterval(() => {
+      setSearchStepIndex((previous) => (previous + 1) % SEARCH_PROGRESS_STEPS.length)
+    }, 1200)
+
+    return () => window.clearInterval(timer)
+  }, [loading])
+
+  useEffect(() => {
+    if (result) {
+      void loadMediaFiles(entityName)
+    }
+  }, [entityName, result])
 
   async function loadEntityOptions(keyword: string) {
     const target = keyword.trim()
@@ -617,9 +741,9 @@ function App() {
       <section className="hero" id="search">
         <div className="hero-inner">
           <p className="hero-badge">🛡️ 第三方評論匯整平台</p>
-          <h1 className="hero-title">搜尋動保園區，查看全網評論</h1>
+          <h1 className="hero-title">搜尋動保園區，快速看口碑評價</h1>
           <p className="hero-subtitle">
-            匯整 Google、Facebook、PTT、Dcard、新聞等平台的公開評論，AI 摘要分析，一站掌握。
+            目前主力整理 Firecrawl 與 PTT 的公開內容，優先顯示可讀的評論、心得與爭議摘錄。
           </p>
 
           <form className="search-form" onSubmit={handleSubmit}>
@@ -666,6 +790,21 @@ function App() {
             </div>
 
             {error ? <p className="error-msg">{error}</p> : null}
+
+            {loading ? (
+              <div className="search-loading-panel" aria-live="polite">
+                <div className="loading-pulse-row">
+                  {SEARCH_PROGRESS_STEPS.map((step, index) => (
+                    <span
+                      key={step}
+                      className={`loading-dot${index === searchStepIndex ? ' active' : ''}${index < searchStepIndex ? ' done' : ''}`}
+                    />
+                  ))}
+                </div>
+                <p className="loading-title">搜尋中，正在整理可用證據</p>
+                <p className="loading-detail">{SEARCH_PROGRESS_STEPS[searchStepIndex]}</p>
+              </div>
+            ) : null}
           </form>
 
           {entityOptions.length > 0 ? (
@@ -745,10 +884,14 @@ function App() {
                     </div>
                   ))}
                 </div>
+                <p className="metric-explainer">
+                  {metricBars.map((item) => `${item.label}：${getMetricDescription(item.label, item.value)}`).join(' ')}
+                </p>
               </div>
 
               <div className="summary-card">
                 <h3>⚠️ 主要疑慮</h3>
+                <p className="summary-caption">優先列出高相關、非單純轉述的來源；如果證據太弱，這裡會保守顯示。</p>
                 <ul className="point-list">
                   {result.summary.supporting_points.slice(0, 3).map((item) => (
                     <li key={item} className="point-item concern">{item}</li>
@@ -758,6 +901,7 @@ function App() {
 
               <div className="summary-card">
                 <h3>✅ 正面資訊</h3>
+                <p className="summary-caption">包含改善措施、官方回應與較可交叉對照的正面資訊。</p>
                 <ul className="point-list">
                   {result.summary.opposing_points.slice(0, 3).map((item) => (
                     <li key={item} className="point-item positive">{item}</li>
@@ -767,6 +911,7 @@ function App() {
 
               <div className="summary-card">
                 <h3>❓ 待查證</h3>
+                <p className="summary-caption">這些多半屬於訪談引述、片段敘述或證據不足，適合人工複核。</p>
                 <ul className="point-list">
                   {result.summary.uncertain_points.slice(0, 3).map((item) => (
                     <li key={item} className="point-item uncertain">{item}</li>
@@ -799,7 +944,7 @@ function App() {
             <div className="reviews-section">
               <div className="reviews-header">
                 <h3>📝 評論與證據（{result.evidence_cards.length}）</h3>
-                <p className="reviews-hint">ⓘ 部分內容已透過 AI 摘要整理</p>
+                <p className="reviews-hint">ⓘ 這裡優先顯示可讀的評論摘錄；空白社群頁與低品質結果已自動過濾</p>
               </div>
 
               <div className="platform-tabs">
@@ -839,7 +984,11 @@ function App() {
               </div>
 
               <div className="review-list">
-                {visibleCards.map((card) => (
+                {visibleCards.length === 0 ? (
+                  <div className="empty-review-state">
+                    目前這個篩選條件下沒有可顯示的結果，建議切回「全部」或改看其他平台。
+                  </div>
+                ) : visibleCards.map((card) => (
                   <article className="review-card" key={`${card.url}-${card.title}`}>
                     <div className="review-top">
                       <div className="review-avatar">{card.source.slice(0, 1).toUpperCase()}</div>
@@ -855,9 +1004,15 @@ function App() {
                     </div>
 
                     <h4 className="review-title">{card.title}</h4>
-                    <p className="review-snippet">{card.snippet}</p>
+                    {card.ai_summary ? <p className="review-summary">{card.ai_summary}</p> : null}
+                    <div className="review-excerpt-block">
+                      <span className="review-excerpt-label">相關摘錄</span>
+                      <p className="review-snippet">{getCardExcerpt(card)}</p>
+                    </div>
 
                     <div className="review-tags">
+                      <span className="platform-tag">{getPlatformLabel(card)}</span>
+                      <span className={`origin-tag ${getEvidenceOriginClassName(card)}`}>{getEvidenceOriginLabel(card)}</span>
                       <span>{getClaimTypeLabel(card.claim_type)}</span>
                       <span>強度：{getStrengthLabel(card.evidence_strength)}</span>
                       <span>第一手 {card.first_hand_score}</span>
@@ -868,6 +1023,7 @@ function App() {
                     {card.notes ? <p className="review-note">{card.notes}</p> : null}
 
                     <div className="review-footer">
+                      <span className="review-url">{new URL(card.url).hostname}</span>
                       <a href={card.url} target="_blank" rel="noreferrer" className="view-original">
                         查看原文 →
                       </a>

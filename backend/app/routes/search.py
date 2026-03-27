@@ -55,14 +55,15 @@ async def search_reputation(
     request: SearchRequest,
     settings: Settings = Depends(get_settings),
 ) -> SearchResponse:
-    search_service = SearchService(settings)
-    analysis_service = AnalysisService(settings)
     persistence_service = PersistenceService(settings)
+    search_service = SearchService(settings, persistence_service=persistence_service)
+    analysis_service = AnalysisService(settings)
 
     expanded_queries, raw_results, mode = await search_service.search(
         entity_name=request.entity_name,
         question=request.question,
     )
+    persistence_service.cache_raw_sources(raw_results)
     summary, evidence_cards = await analysis_service.analyze(
         entity_name=request.entity_name,
         question=request.question,

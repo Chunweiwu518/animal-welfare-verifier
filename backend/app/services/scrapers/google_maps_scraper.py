@@ -19,6 +19,13 @@ logger = logging.getLogger(__name__)
 SERPAPI_BASE = "https://serpapi.com/search.json"
 
 
+def _normalize_rating(value: object) -> int:
+    try:
+        return max(0, int(round(float(value))))
+    except (TypeError, ValueError):
+        return 0
+
+
 async def search_google_maps(
     entity_name: str,
     serpapi_key: str | None = None,
@@ -91,21 +98,21 @@ async def search_google_maps(
         reviews = data.get("reviews", [])
         for review in reviews[: max_results - 1]:
             user_name = review.get("user", {}).get("name", "匿名用戶")
-            rating = review.get("rating", 0)
+            rating_value = _normalize_rating(review.get("rating", 0))
             snippet = review.get("snippet", review.get("extracted_snippet", {}).get("original", ""))
             date_str = review.get("date", "")
             link = review.get("link", f"https://www.google.com/maps/place/?q=place_id:{place_id}")
 
             results.append({
-                "title": f"[Google Maps 評論] {user_name} — {'⭐' * rating}",
+                "title": f"[Google Maps 評論] {user_name} — {'⭐' * rating_value}",
                 "url": link,
-                "content": snippet[:700] if snippet else f"{user_name} 給予 {rating} 星評價。",
+                "content": snippet[:700] if snippet else f"{user_name} 給予 {rating_value} 星評價。",
                 "source": "Google Maps",
                 "source_type": "other",
                 "published_date": _parse_relative_date(date_str),
                 "fetched_at": now,
                 "platform": "google_maps",
-                "user_rating": rating,
+                "user_rating": rating_value,
             })
 
     return results
@@ -144,4 +151,3 @@ def _parse_relative_date(date_str: str) -> str | None:
     # For now, just return None — relative dates are hard to parse exactly
     # The recency_label logic in AnalysisService handles "unknown" gracefully
     return None
-
