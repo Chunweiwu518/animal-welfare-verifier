@@ -48,3 +48,17 @@ def test_serves_frontend_index_for_unknown_spa_route(tmp_path: Path) -> None:
 
     assert response.status_code == 200
     assert "spa" in response.text
+
+
+def test_serves_frontend_index_for_encoded_entity_route(tmp_path: Path) -> None:
+    dist_dir = tmp_path / "static"
+    dist_dir.mkdir()
+    (dist_dir / "index.html").write_text("<html><body>entity-page</body></html>", encoding="utf-8")
+
+    app = create_app(Settings(frontend_dist_dir=str(dist_dir), database_path=str(tmp_path / "test.db")))
+    client = TestClient(app)
+
+    response = client.get("/entities/%E6%9C%A8%E6%9F%B5%E5%8B%95%E7%89%A9%E5%9C%92")
+
+    assert response.status_code == 200
+    assert "entity-page" in response.text

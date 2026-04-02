@@ -9,7 +9,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 
-from app.config import Settings, get_settings
+from app.config import Settings, get_request_settings
 from app.models.media import (
     MediaFileResponse,
     MediaListResponse,
@@ -56,10 +56,11 @@ async def upload_media(
     request: Request,
     file: UploadFile = File(...),
     entity_name: str = Form(...),
+    comment: str = Form(""),
     caption: str = Form(""),
-    settings: Settings = Depends(get_settings),
+    settings: Settings = Depends(get_request_settings),
 ) -> MediaUploadResponse:
-    """Upload a photo or video file."""
+    """Upload a photo or video file with an optional comment."""
     # Validate content type
     content_type = file.content_type or ""
     if content_type not in ALLOWED_TYPES:
@@ -101,6 +102,8 @@ async def upload_media(
     # Get uploader IP
     uploader_ip = request.client.host if request.client else ""
 
+    normalized_caption = comment.strip() or caption.strip()
+
     # Save metadata to DB
     persistence = PersistenceService(settings)
     file_id = persistence.save_media_file(
@@ -111,7 +114,7 @@ async def upload_media(
         mime_type=content_type,
         file_size=file_size,
         uploader_ip=uploader_ip,
-        caption=caption.strip(),
+        caption=normalized_caption,
         width=width,
         height=height,
     )
@@ -126,7 +129,7 @@ async def upload_media(
 @router.get("/file/{file_name}")
 async def serve_media_file(
     file_name: str,
-    settings: Settings = Depends(get_settings),
+    settings: Settings = Depends(get_request_settings),
 ) -> FileResponse:
     """Serve a media file by its stored filename."""
     upload_dir = _get_upload_dir(settings)
@@ -148,7 +151,7 @@ async def list_media(
     media_type: str | None = None,
     limit: int = 50,
     offset: int = 0,
-    settings: Settings = Depends(get_settings),
+    settings: Settings = Depends(get_request_settings),
 ) -> MediaListResponse:
     """List uploaded media files, optionally filtered by entity or type."""
     persistence = PersistenceService(settings)
@@ -163,7 +166,7 @@ async def list_media(
 @router.get("/stats", response_model=MediaStatsResponse)
 async def media_stats(
     entity_name: str | None = None,
-    settings: Settings = Depends(get_settings),
+    settings: Settings = Depends(get_request_settings),
 ) -> MediaStatsResponse:
     """Get media upload statistics."""
     persistence = PersistenceService(settings)
@@ -173,7 +176,7 @@ async def media_stats(
 @router.delete("/{file_id}")
 async def delete_media(
     file_id: int,
-    settings: Settings = Depends(get_settings),
+    settings: Settings = Depends(get_request_settings),
 ) -> dict[str, str]:
     """Delete a media file."""
     persistence = PersistenceService(settings)

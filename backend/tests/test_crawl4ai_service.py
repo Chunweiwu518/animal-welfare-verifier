@@ -16,6 +16,33 @@ def test_crawl4ai_service_selects_supported_platform_urls() -> None:
     assert selected == {0, 1}
 
 
+def test_crawl4ai_service_selects_supported_news_and_fundraising_urls() -> None:
+    service = Crawl4AIService(Settings(crawl4ai_url_limit=3))
+
+    selected = service._select_target_indexes(
+        [
+            {"url": "https://www.flyingv.cc/projects/14186", "content": "短內容"},
+            {"url": "https://news.example.org/dongwangwang", "content": "短內容"},
+            {"url": "https://example.org/landing", "content": "短內容"},
+        ]
+    )
+
+    assert selected == {0, 1}
+
+
+def test_crawl4ai_service_keeps_crawling_supported_official_pages_with_medium_length_text() -> None:
+    service = Crawl4AIService(Settings(crawl4ai_url_limit=3))
+
+    selected = service._select_target_indexes(
+        [
+            {"url": "https://dongwangwang.bobo.care/faq/", "content": "這是一段中等長度內容。" * 20, "source_type": "official"},
+            {"url": "https://example.org/landing", "content": "短內容", "source_type": "other"},
+        ]
+    )
+
+    assert selected == {0}
+
+
 def test_crawl4ai_service_merges_markdown_content() -> None:
     service = Crawl4AIService(Settings())
 

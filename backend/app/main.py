@@ -49,6 +49,7 @@ def _configure_frontend_routes(app: FastAPI, settings: Settings) -> None:
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     resolved_settings = settings or get_settings()
+    PersistenceService(resolved_settings).initialize()
     allow_all_origins = resolved_settings.cors_allow_origins.strip() == "*"
     allow_origins = (
         ["*"]
@@ -58,10 +59,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
-        PersistenceService(resolved_settings).initialize()
         yield
 
     app = FastAPI(title=resolved_settings.app_name, lifespan=lifespan)
+    app.state.settings = resolved_settings
     app.add_middleware(
         CORSMiddleware,
         allow_origins=allow_origins,

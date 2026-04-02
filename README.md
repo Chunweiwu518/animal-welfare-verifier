@@ -11,9 +11,9 @@ Search-first reputation and evidence platform for animal-related organizations o
 ## What this MVP does
 
 - accepts an entity name and a targeted question
-- expands the query into multiple review-focused search phrases
+- expands the query into multiple evidence-focused search phrases
 - searches the web with Firecrawl when configured
-- supplements Taiwan forum reputation signals with PTT
+- supplements Taiwan forum reputation signals with PTT and other public evidence sources
 - falls back to mock evidence when no API key is present
 - classifies evidence into supporting, opposing, or neutral cards
 - generates a balanced summary with confidence and follow-up suggestions

@@ -31,23 +31,38 @@ class FirecrawlService:
         }
         now = datetime.now(timezone.utc).isoformat()
         merged: list[dict[str, Any]] = []
+        stop_due_to_quota = False
 
         async with httpx.AsyncClient(timeout=float(timeout_seconds), headers=headers) as client:
-            payloads = await asyncio.gather(
-                *[
-                    self._run_search_query(client, query=query, limit=results_per_query, fetched_at=now)
-                    for query in queries[:query_limit]
-                ],
-                return_exceptions=True,
-            )
+            for index in range(0, len(queries), query_limit):
+                if stop_due_to_quota:
+                    break
+                batch = queries[index:index + query_limit]
+                payloads = await asyncio.gather(
+                    *[
+                        self._run_search_query(client, query=query, limit=results_per_query, fetched_at=now)
+                        for query in batch
+                    ],
+                    return_exceptions=True,
+                )
 
-        for payload in payloads:
-            if isinstance(payload, Exception):
-                logger.warning("Firecrawl search failed: %s", payload)
-                continue
-            merged.extend(payload)
+                for payload in payloads:
+                    if isinstance(payload, Exception):
+                        logger.warning("Firecrawl search failed: %s", payload)
+                        if self._is_payment_required_error(payload):
+                            stop_due_to_quota = True
+                            break
+                        continue
+                    merged.extend(payload)
 
         return merged
+
+    def _is_payment_required_error(self, error: Exception) -> bool:
+        return (
+            isinstance(error, httpx.HTTPStatusError)
+            and error.response is not None
+            and error.response.status_code == 402
+        )
 
     async def _run_search_query(
         self,
@@ -93,6 +108,7 @@ class FirecrawlService:
                     "title": str(item.get("title") or metadata.get("title") or "").strip(),
                     "content": str(item.get("markdown") or "").strip(),
                     "snippet": str(item.get("description") or item.get("snippet") or "").strip(),
+                    "matched_query": query,
                     "source": str(metadata.get("sourceURL") or metadata.get("siteName") or "").strip(),
                     "source_type": "",
                     "published_date": str(metadata.get("publishedTime") or metadata.get("published_time") or "").strip() or None,

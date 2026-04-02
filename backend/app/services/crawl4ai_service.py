@@ -13,6 +13,12 @@ class Crawl4AIService:
     def __init__(self, settings: Settings):
         self.settings = settings
 
+    async def fetch_pages(self, urls: list[str]) -> dict[str, dict[str, Any]]:
+        normalized_urls = [str(url).strip() for url in urls if str(url).strip()]
+        if not normalized_urls or not self.settings.crawl4ai_enabled:
+            return {}
+        return await self._crawl_urls(normalized_urls)
+
     async def enrich_results(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not self.settings.crawl4ai_enabled:
             return items
@@ -47,7 +53,8 @@ class Crawl4AIService:
             if not url or not self._should_crawl_url(url):
                 continue
             text = str(item.get("content") or item.get("snippet") or "").strip()
-            if len(text) >= 180:
+            source_type = str(item.get("source_type") or "")
+            if len(text) >= 1200 and source_type in {"official", "news"}:
                 continue
             selected.add(index)
             if len(selected) >= limit:
@@ -162,5 +169,9 @@ class Crawl4AIService:
                 "threads.net",
                 "instagram.com",
                 "ptt.cc",
+                "bobo.care",
+                "flyingv.cc",
+                "newebpay.com",
+                "news.",
             )
         )

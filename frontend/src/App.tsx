@@ -38,7 +38,9 @@ type EvidenceCard = {
 }
 
 type SearchResponse = {
-  mode: 'live' | 'mock'
+  mode: 'live' | 'mock' | 'cached'
+  search_mode: 'general' | 'animal_law'
+  animal_focus: boolean
   expanded_queries: string[]
   summary: {
     verdict: string
@@ -49,6 +51,29 @@ type SearchResponse = {
     suggested_follow_up: string[]
   }
   evidence_cards: EvidenceCard[]
+  diagnostics: {
+    query_count: number
+    raw_merged_results: number
+    deduplicated_results: number
+    low_signal_filtered: number
+    relevance_filtered: number
+    prioritized_results: number
+    final_results: number
+    providers: {
+      firecrawl_results: number
+      serpapi_results: number
+      platform_results: number
+      cached_results: number
+    }
+    analysis?: {
+      input_results: number
+      noise_filtered: number
+      low_relevance_filtered: number
+      gray_candidates: number
+      ai_gray_filtered: number
+      final_cards: number
+    } | null
+  }
 }
 
 type SourceBreakdownItem = {
@@ -75,6 +100,35 @@ type EntityProfileResponse = {
   recent_queries: RecentQueryItem[]
 }
 
+type EntityPageImageItem = {
+  url: string
+  alt_text: string
+  caption: string
+  source_page_url: string
+}
+
+type EntityComment = {
+  id: number
+  entity_name: string
+  comment: string
+  created_at: string
+}
+
+type EntityPageResponse = {
+  entity_name: string
+  entity_type: string
+  aliases: string[]
+  headline: string
+  introduction: string
+  location: string
+  cover_image_url: string
+  cover_image_alt: string
+  gallery: EntityPageImageItem[]
+  total_comments: number
+  comments: EntityComment[]
+  recent_media: MediaFile[]
+}
+
 type EntityListItem = {
   entity_name: string
   aliases: string[]
@@ -86,7 +140,32 @@ type EntityListResponse = {
   items: EntityListItem[]
 }
 
-type ReviewFilter =
+type EntityQuestionSuggestionItem = {
+  category: string
+  question_text: string
+  confidence_score: number
+  generated_from: string
+}
+
+type EntityQuestionSuggestionsResponse = {
+  entity_name: string
+  mode: 'general' | 'animal_law'
+  animal_focus: boolean
+  items: EntityQuestionSuggestionItem[]
+}
+
+type EntitySummarySnapshotResponse = {
+  entity_name: string
+  mode: 'general' | 'animal_law'
+  animal_focus: boolean
+  source_count: number
+  source_window_days: number
+  generated_at: string
+  summary: SearchResponse['summary']
+  evidence_cards: EvidenceCard[]
+}
+
+type EvidenceFilter =
   | '全部'
   | '最新'
   | '支持疑慮'
@@ -103,41 +182,82 @@ const DEFAULT_API_BASE_URL =
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? DEFAULT_API_BASE_URL
 
 const COMMON_QUESTIONS = [
-  '近期評價是偏正面還是偏負面？',
-  '有哪些真實心得、推薦或不推薦？',
-  '最近是否有照護爭議或負評？',
-  'Google 與 PTT 上怎麼說？',
+  '近期整體資訊是偏正面還是偏負面？',
+  '有哪些真實心得、官方說法與第三方資料？',
+  '最近是否有照護爭議、聲明或負面新聞？',
+  'Google、PTT、社群與新聞上怎麼說？',
 ]
 
-const PLATFORM_LABELS = ['Google 評論', 'Facebook', 'Instagram', 'Threads', 'Dcard', 'PTT', '新聞']
+const ANIMAL_FOCUS_QUESTIONS = [
+  '是否可能涉及動保法、虐待、棄養或超收問題？',
+  '有哪些內容明確提到動物福利、照護或飼養環境疑慮？',
+  '最近是否有收容、繁殖、救援、醫療或死亡相關爭議？',
+  '目前公開資料可支持哪些動物福利疑慮，哪些部分仍待查？',
+]
+
+const PLATFORM_LABELS = ['Google', 'Facebook', 'Instagram', 'Threads', 'Dcard', 'PTT', '新聞', '官方']
 const SEARCH_SESSION_STORAGE_KEY = 'animal-welfare-search-session-v1'
 const SEARCH_PROGRESS_STEPS = [
-  '正在展開評論、評價、心得等查詢詞',
-  '正在整理 Firecrawl 與 PTT 的口碑來源',
-  '正在清洗內文並挑出可讀的評論摘錄',
+  '正在展開爭議、聲明、評論與募資等查詢詞',
+  '正在整理 Firecrawl、PTT 與其他公開來源',
+  '正在清洗內文並挑出可讀的證據摘錄',
 ] as const
 
-type PlatformTab = '本平台' | typeof PLATFORM_LABELS[number]
+const ANIMAL_SEARCH_PROGRESS_STEPS = [
+  '正在展開動保法、動物福利、照護與稽查相關查詢詞',
+  '正在優先整理與收容、繁殖、虐待、棄養有關的公開來源',
+  '正在排除非動物相關內容並保守整理可引用證據',
+] as const
+
+type PlatformTab = '全部來源' | typeof PLATFORM_LABELS[number]
 type SearchSessionState = {
   entityName: string
   question: string
+  animalFocus: boolean
   result: SearchResponse | null
   profile: EntityProfileResponse | null
-  activeFilter: ReviewFilter
+  activeFilter: EvidenceFilter
   activePlatform: PlatformTab
 }
 
+type AppRoute =
+  | { name: 'home' }
+  | { name: 'entity'; entityName: string }
+
+function parseAppRoute(pathname: string): AppRoute {
+  const trimmedPath = pathname.replace(/\/+$/, '') || '/'
+  if (!trimmedPath.startsWith('/entities/')) {
+    return { name: 'home' }
+  }
+
+  const rawEntityName = trimmedPath.slice('/entities/'.length)
+  if (!rawEntityName) {
+    return { name: 'home' }
+  }
+
+  try {
+    return { name: 'entity', entityName: decodeURIComponent(rawEntityName) }
+  } catch {
+    return { name: 'home' }
+  }
+}
+
+function buildEntityPath(entityName: string) {
+  return `/entities/${encodeURIComponent(entityName.trim())}`
+}
+
 function matchPlatform(card: EvidenceCard, platform: PlatformTab): boolean {
-  if (platform === '本平台') return true
+  if (platform === '全部來源') return true
   const src = (card.source + ' ' + card.url).toLowerCase()
   switch (platform) {
-    case 'Google 評論': return src.includes('google') || src.includes('maps')
+    case 'Google': return src.includes('google') || src.includes('maps')
     case 'Facebook': return src.includes('facebook') || src.includes('fb.com')
     case 'Instagram': return src.includes('instagram') || src.includes('ig')
     case 'Threads': return src.includes('threads')
     case 'Dcard': return src.includes('dcard')
     case 'PTT': return src.includes('ptt')
     case '新聞': return card.source_type === 'news'
+    case '官方': return card.source_type === 'official'
     default: return true
   }
 }
@@ -148,7 +268,11 @@ function countPlatformCards(cards: EvidenceCard[], platform: PlatformTab): numbe
 
 function getModeLabel(mode: SearchResponse['mode'] | null) {
   if (mode === 'live') {
-    return '即時評論搜尋'
+    return '即時全網搜尋'
+  }
+
+  if (mode === 'cached') {
+    return '資料庫快取'
   }
 
   if (mode === 'mock') {
@@ -156,6 +280,11 @@ function getModeLabel(mode: SearchResponse['mode'] | null) {
   }
 
   return '待搜尋'
+}
+
+function getSearchModeLabel(result: SearchResponse | null, animalFocus: boolean) {
+  const focusEnabled = result?.animal_focus ?? animalFocus
+  return focusEnabled ? '動保法模式' : '一般模式'
 }
 
 function getStanceLabel(stance: EvidenceCard['stance']) {
@@ -317,7 +446,7 @@ function toFivePointScore(score: number) {
   return (score / 20).toFixed(1)
 }
 
-function getFilterCount(filter: ReviewFilter, cards: EvidenceCard[]) {
+function getFilterCount(filter: EvidenceFilter, cards: EvidenceCard[]) {
   switch (filter) {
     case '全部':
       return cards.length
@@ -338,7 +467,7 @@ function getFilterCount(filter: ReviewFilter, cards: EvidenceCard[]) {
   }
 }
 
-function filterEvidenceCards(filter: ReviewFilter, cards: EvidenceCard[]) {
+function filterEvidenceCards(filter: EvidenceFilter, cards: EvidenceCard[]) {
   const sortedCards = [...cards]
 
   if (filter === '最新') {
@@ -383,10 +512,10 @@ function getReviewTone(cards: EvidenceCard[]) {
     return '近期正面與改善資訊較多'
   }
 
-  return '近期評價偏混合'
+    return '近期資訊偏混合'
 }
 
-function getFakePlatformReviewCount(cards: EvidenceCard[]) {
+function getEvidenceCount(cards: EvidenceCard[]) {
   return cards.length
 }
 
@@ -467,14 +596,21 @@ function buildStoredSession(state: SearchSessionState) {
 }
 
 function App() {
+  const [route, setRoute] = useState<AppRoute>(() => parseAppRoute(window.location.pathname))
   const [entityName, setEntityName] = useState('某某動物園區')
   const [question, setQuestion] = useState('是否有募資不透明或動物福利爭議？')
+  const [animalFocus, setAnimalFocus] = useState(false)
   const [result, setResult] = useState<SearchResponse | null>(null)
   const [profile, setProfile] = useState<EntityProfileResponse | null>(null)
+  const [entityPageData, setEntityPageData] = useState<EntityPageResponse | null>(null)
   const [entityOptions, setEntityOptions] = useState<EntityListItem[]>([])
-  const [activeFilter, setActiveFilter] = useState<ReviewFilter>('全部')
-  const [activePlatform, setActivePlatform] = useState<PlatformTab>('本平台')
+  const [entitySnapshot, setEntitySnapshot] = useState<EntitySummarySnapshotResponse | null>(null)
+  const [entityQuestions, setEntityQuestions] = useState<EntityQuestionSuggestionItem[]>([])
+  const [activeFilter, setActiveFilter] = useState<EvidenceFilter>('全部')
+  const [activePlatform, setActivePlatform] = useState<PlatformTab>('全部來源')
   const [loading, setLoading] = useState(false)
+  const [entityPageLoading, setEntityPageLoading] = useState(false)
+  const [entityPageError, setEntityPageError] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [searchStepIndex, setSearchStepIndex] = useState(0)
   const resultSectionRef = useRef<HTMLElement | null>(null)
@@ -483,19 +619,57 @@ function App() {
   const [mediaFiles, setMediaFiles] = useState<MediaFile[]>([])
   const [uploadQueue, setUploadQueue] = useState<{ file: File; progress: number; status: 'pending' | 'uploading' | 'done' | 'error'; errorMsg?: string }[]>([])
   const [isDragging, setIsDragging] = useState(false)
-  const [uploadCaption, setUploadCaption] = useState('')
+  const [uploadComment, setUploadComment] = useState('')
+  const [commentSubmitting, setCommentSubmitting] = useState(false)
+  const [commentError, setCommentError] = useState<string | null>(null)
+  const [hiddenBrokenImages, setHiddenBrokenImages] = useState<Record<string, boolean>>({})
   const fileInputRef = useRef<HTMLInputElement | null>(null)
 
-  const reviewFilters: ReviewFilter[] = ['全部', '最新', '支持疑慮', '反駁疑慮', '官方', '新聞', '論壇', '社群']
+  const evidenceFilters: EvidenceFilter[] = ['全部', '最新', '支持疑慮', '反駁疑慮', '官方', '新聞', '論壇', '社群']
+  const isEntityRoute = route.name === 'entity'
+  const quickQuestions = entityQuestions.length
+    ? entityQuestions.map((item) => item.question_text)
+    : (animalFocus ? ANIMAL_FOCUS_QUESTIONS : COMMON_QUESTIONS)
+  const searchProgressSteps = animalFocus ? ANIMAL_SEARCH_PROGRESS_STEPS : SEARCH_PROGRESS_STEPS
+  const questionPlaceholder = animalFocus
+    ? '例如：是否可能涉及動保法、超收、飼養環境或照護問題？'
+    : '例如：是否有動物福利爭議？'
   const sourceTypeSummary = result ? buildSourceTypeSummary(result.evidence_cards) : []
   const platformCards = result ? result.evidence_cards.filter((c) => matchPlatform(c, activePlatform)) : []
   const visibleCards = result ? filterEvidenceCards(activeFilter, platformCards) : []
   const overallScore = result ? getOverallScore(result, profile) : 0
   const metricBars = result ? getMetricBars(result.evidence_cards, overallScore) : []
+  const entityPagePlatformCards = entitySnapshot ? entitySnapshot.evidence_cards.filter((card) => matchPlatform(card, activePlatform)) : []
+  const entityPageVisibleCards = entitySnapshot ? filterEvidenceCards(activeFilter, entityPagePlatformCards).slice(0, 6) : []
+  const entityPageSourceSummary = entitySnapshot ? buildSourceTypeSummary(entitySnapshot.evidence_cards) : []
+  const entityPageScore = entitySnapshot
+    ? Math.max(0, Math.min(100, Math.round((profile?.average_credibility ?? entitySnapshot.summary.confidence) * 0.5 + entitySnapshot.summary.confidence * 0.5)))
+    : 0
+  const selectedEntityLabel = entityPageData?.entity_name ?? profile?.entity_name ?? entitySnapshot?.entity_name ?? entityName
 
   useEffect(() => {
     try {
       const raw = window.sessionStorage.getItem(SEARCH_SESSION_STORAGE_KEY)
+      if (route.name === 'entity') {
+        setEntityName(route.entityName)
+        if (!raw) {
+          void loadEntityOptions(route.entityName)
+          return
+        }
+
+        const restored = JSON.parse(raw) as SearchSessionState
+        if (restored.entityName === route.entityName) {
+          setQuestion(restored.question)
+          setAnimalFocus(Boolean(restored.animalFocus))
+          setResult(restored.result)
+          setProfile(restored.profile)
+          setActiveFilter(restored.activeFilter)
+          setActivePlatform(restored.activePlatform)
+        }
+        void loadEntityOptions(route.entityName)
+        return
+      }
+
       if (!raw) {
         void loadEntityOptions('')
         return
@@ -504,6 +678,7 @@ function App() {
       const restored = JSON.parse(raw) as SearchSessionState
       setEntityName(restored.entityName)
       setQuestion(restored.question)
+      setAnimalFocus(Boolean(restored.animalFocus))
       setResult(restored.result)
       setProfile(restored.profile)
       setActiveFilter(restored.activeFilter)
@@ -515,12 +690,47 @@ function App() {
   }, [])
 
   useEffect(() => {
+    function handlePopState() {
+      setRoute(parseAppRoute(window.location.pathname))
+    }
+
+    window.addEventListener('popstate', handlePopState)
+    return () => window.removeEventListener('popstate', handlePopState)
+  }, [])
+
+  useEffect(() => {
+    if (route.name !== 'entity') {
+      setEntityPageData(null)
+      setEntityPageError(null)
+      setEntityPageLoading(false)
+      setCommentError(null)
+      setHiddenBrokenImages({})
+      return
+    }
+
+    if (entityName.trim() !== route.entityName.trim()) {
+      setResult(null)
+      setProfile(null)
+      setEntityPageData(null)
+      setMediaFiles([])
+      setUploadComment('')
+    }
+
+    setEntityName(route.entityName)
+  }, [entityName, route])
+
+  useEffect(() => {
+    setHiddenBrokenImages({})
+  }, [entityPageData?.entity_name, entityPageData?.cover_image_url, entityPageData?.gallery.length])
+
+  useEffect(() => {
     try {
       window.sessionStorage.setItem(
         SEARCH_SESSION_STORAGE_KEY,
         buildStoredSession({
           entityName,
           question,
+          animalFocus,
           result,
           profile,
           activeFilter,
@@ -530,7 +740,7 @@ function App() {
     } catch {
       // Ignore storage failures on restricted browsers.
     }
-  }, [activeFilter, activePlatform, entityName, profile, question, result])
+  }, [activeFilter, activePlatform, animalFocus, entityName, profile, question, result])
 
   useEffect(() => {
     if (!loading) {
@@ -539,17 +749,75 @@ function App() {
     }
 
     const timer = window.setInterval(() => {
-      setSearchStepIndex((previous) => (previous + 1) % SEARCH_PROGRESS_STEPS.length)
+      setSearchStepIndex((previous) => (previous + 1) % searchProgressSteps.length)
     }, 1200)
 
     return () => window.clearInterval(timer)
-  }, [loading])
+  }, [loading, searchProgressSteps])
 
   useEffect(() => {
     if (result) {
       void loadMediaFiles(entityName)
     }
   }, [entityName, result])
+
+  useEffect(() => {
+    if (isEntityRoute) {
+      return
+    }
+
+    const target = entityName.trim()
+    if (target.length < 2) {
+      setEntitySnapshot(null)
+      setEntityQuestions([])
+      return
+    }
+
+    const timer = window.setTimeout(() => {
+      void loadEntityDatabasePreview(target, animalFocus)
+    }, 250)
+
+    return () => window.clearTimeout(timer)
+  }, [animalFocus, entityName, isEntityRoute])
+
+  useEffect(() => {
+    if (route.name !== 'entity') {
+      return
+    }
+
+    const target = route.entityName.trim()
+    if (target.length < 2) {
+      setEntityPageError('實體名稱格式不正確。')
+      return
+    }
+
+    let isCurrent = true
+    setEntityPageLoading(true)
+    setEntityPageError(null)
+
+    void (async () => {
+      const [previewData, profileData, pageData, mediaData] = await Promise.all([
+        loadEntityDatabasePreview(target, animalFocus),
+        loadEntityProfile(target),
+        loadEntityPage(target),
+        loadMediaFiles(target),
+      ])
+
+      if (!isCurrent) {
+        return
+      }
+
+      const hasAnyData = Boolean(previewData.snapshot || previewData.suggestions.length || profileData || pageData || mediaData.length)
+      if (!hasAnyData) {
+        setEntityPageError('目前這個實體還沒有整理完成，可先送出一次搜尋建立摘要。')
+      }
+      setEntityPageLoading(false)
+    })()
+
+    return () => {
+      isCurrent = false
+    }
+  }, [animalFocus, route])
 
   async function loadEntityOptions(keyword: string) {
     const target = keyword.trim()
@@ -563,8 +831,116 @@ function App() {
     setEntityOptions(data.items)
   }
 
+  async function loadEntityDatabasePreview(targetEntity: string, focusEnabled: boolean) {
+    const suffix = focusEnabled ? '?animal_focus=true' : ''
+
+    try {
+      const [snapshotResponse, suggestionsResponse] = await Promise.all([
+        fetch(`${API_BASE_URL}/api/entities/${encodeURIComponent(targetEntity)}/snapshot${suffix}`),
+        fetch(`${API_BASE_URL}/api/entities/${encodeURIComponent(targetEntity)}/suggestions${suffix}`),
+      ])
+
+      let snapshotData: EntitySummarySnapshotResponse | null = null
+      if (snapshotResponse.ok) {
+        snapshotData = await snapshotResponse.json()
+        setEntitySnapshot(snapshotData)
+      } else {
+        setEntitySnapshot(null)
+      }
+
+      let suggestionItems: EntityQuestionSuggestionItem[] = []
+      if (suggestionsResponse.ok) {
+        const suggestionsData: EntityQuestionSuggestionsResponse = await suggestionsResponse.json()
+        suggestionItems = suggestionsData.items
+        setEntityQuestions(suggestionsData.items)
+      } else {
+        setEntityQuestions([])
+      }
+
+      return {
+        snapshot: snapshotData,
+        suggestions: suggestionItems,
+      }
+    } catch {
+      setEntitySnapshot(null)
+      setEntityQuestions([])
+      return {
+        snapshot: null,
+        suggestions: [] as EntityQuestionSuggestionItem[],
+      }
+    }
+  }
+
+  async function loadEntityProfile(targetEntity: string) {
+    try {
+      const profileResponse = await fetch(
+        `${API_BASE_URL}/api/entities/${encodeURIComponent(targetEntity)}/profile`,
+      )
+      if (!profileResponse.ok) {
+        setProfile(null)
+        return null
+      }
+
+      const profileData: EntityProfileResponse = await profileResponse.json()
+      setProfile(profileData)
+      return profileData
+    } catch {
+      setProfile(null)
+      return null
+    }
+  }
+
+  async function loadEntityPage(targetEntity: string) {
+    try {
+      const pageResponse = await fetch(
+        `${API_BASE_URL}/api/entities/${encodeURIComponent(targetEntity)}/page`,
+      )
+      if (!pageResponse.ok) {
+        setEntityPageData(null)
+        return null
+      }
+
+      const pageData: EntityPageResponse = await pageResponse.json()
+      setEntityPageData(pageData)
+      return pageData
+    } catch {
+      setEntityPageData(null)
+      return null
+    }
+  }
+
   function handleQuestionSelect(nextQuestion: string) {
     setQuestion(nextQuestion)
+  }
+
+  function scrollToPageTop() {
+    requestAnimationFrame(() => {
+      window.scrollTo({ top: 0, behavior: 'smooth' })
+    })
+  }
+
+  function navigateToRoute(nextRoute: AppRoute, preserveResult = false) {
+    const nextPath = nextRoute.name === 'entity' ? buildEntityPath(nextRoute.entityName) : '/'
+    window.history.pushState({}, '', nextPath)
+    if (!preserveResult && nextRoute.name === 'entity') {
+      setResult(null)
+      scrollToPageTop()
+    }
+    setRoute(nextRoute)
+  }
+
+  function handleAnimalFocusToggle() {
+    const next = !animalFocus
+    setAnimalFocus(next)
+    setQuestion((current) => {
+      if (next && (!current.trim() || COMMON_QUESTIONS.includes(current))) {
+        return ANIMAL_FOCUS_QUESTIONS[0]
+      }
+      if (!next && ANIMAL_FOCUS_QUESTIONS.includes(current)) {
+        return COMMON_QUESTIONS[0]
+      }
+      return current
+    })
   }
 
   function handleEntityPick(item: EntityListItem) {
@@ -585,6 +961,7 @@ function App() {
         body: JSON.stringify({
           entity_name: entityName,
           question,
+          animal_focus: animalFocus,
         }),
       })
 
@@ -594,18 +971,10 @@ function App() {
 
       const data: SearchResponse = await response.json()
       setResult(data)
+      await loadEntityDatabasePreview(entityName, animalFocus)
+      await loadEntityProfile(entityName)
       setActiveFilter('全部')
-      setActivePlatform('本平台')
-
-      const profileResponse = await fetch(
-        `${API_BASE_URL}/api/entities/${encodeURIComponent(entityName)}/profile`,
-      )
-      if (profileResponse.ok) {
-        const profileData: EntityProfileResponse = await profileResponse.json()
-        setProfile(profileData)
-      } else {
-        setProfile(null)
-      }
+      setActivePlatform('全部來源')
 
       requestAnimationFrame(() => {
         resultSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
@@ -623,18 +992,63 @@ function App() {
       const res = await fetch(`${API_BASE_URL}/api/media/list?entity_name=${encodeURIComponent(entity)}&limit=50`)
       if (res.ok) {
         const data = await res.json()
-        setMediaFiles(data.items ?? [])
+        const items = data.items ?? []
+        setMediaFiles(items)
+        return items
       }
     } catch { /* ignore */ }
+    setMediaFiles([])
+    return [] as MediaFile[]
   }
 
-  async function uploadSingleFile(file: File, idx: number) {
+  async function createEntityComment(targetEntity: string, commentText: string) {
+    const response = await fetch(`${API_BASE_URL}/api/entities/${encodeURIComponent(targetEntity)}/comments`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ comment: commentText }),
+    })
+
+    if (!response.ok) {
+      const payload = await response.json().catch(() => null)
+      throw new Error(payload?.detail ?? '評論送出失敗，請稍後再試。')
+    }
+
+    return response.json() as Promise<EntityComment>
+  }
+
+  async function handleCommentSubmit() {
+    const targetEntity = (entityPageData?.entity_name ?? entityName).trim()
+    const commentText = uploadComment.trim()
+    if (!targetEntity) {
+      setCommentError('找不到對應的實體名稱。')
+      return
+    }
+    if (!commentText) {
+      setCommentError('請先輸入評論內容。')
+      return
+    }
+
+    setCommentSubmitting(true)
+    setCommentError(null)
+    try {
+      await createEntityComment(targetEntity, commentText)
+      await loadEntityPage(targetEntity)
+      setUploadComment('')
+    } catch (err) {
+      setCommentError(err instanceof Error ? err.message : '評論送出失敗，請稍後再試。')
+    } finally {
+      setCommentSubmitting(false)
+    }
+  }
+
+  async function uploadSingleFile(file: File, idx: number, targetEntity: string) {
     setUploadQueue((prev) => prev.map((item, i) => i === idx ? { ...item, status: 'uploading' as const, progress: 0 } : item))
 
     const formData = new FormData()
     formData.append('file', file)
-    formData.append('entity_name', entityName)
-    formData.append('caption', uploadCaption)
+    formData.append('entity_name', targetEntity)
 
     try {
       const xhr = new XMLHttpRequest()
@@ -668,17 +1082,39 @@ function App() {
   async function handleFilesSelected(files: FileList | File[]) {
     const fileArray = Array.from(files)
     if (fileArray.length === 0) return
+    const targetEntity = (entityPageData?.entity_name ?? entityName).trim()
+    const commentText = uploadComment.trim()
+    if (!targetEntity) {
+      setCommentError('找不到對應的實體名稱。')
+      return
+    }
+
+    setCommentError(null)
+
+    if (commentText) {
+      try {
+        setCommentSubmitting(true)
+        await createEntityComment(targetEntity, commentText)
+      } catch (err) {
+        setCommentSubmitting(false)
+        setCommentError(err instanceof Error ? err.message : '評論送出失敗，請稍後再試。')
+        return
+      }
+      setCommentSubmitting(false)
+    }
 
     const newItems = fileArray.map((f) => ({ file: f, progress: 0, status: 'pending' as const }))
     setUploadQueue((prev) => [...prev, ...newItems])
 
     const startIdx = uploadQueue.length
     for (let i = 0; i < fileArray.length; i++) {
-      await uploadSingleFile(fileArray[i], startIdx + i)
+      await uploadSingleFile(fileArray[i], startIdx + i, targetEntity)
     }
 
-    // Reload media list after all uploads
-    await loadMediaFiles(entityName)
+    await Promise.all([loadMediaFiles(targetEntity), loadEntityPage(targetEntity)])
+    if (commentText) {
+      setUploadComment('')
+    }
   }
 
   function handleFileInputChange(e: ChangeEvent<HTMLInputElement>) {
@@ -725,115 +1161,133 @@ function App() {
             <span className="logo-icon">🐾</span>
             <span className="logo-text">動保評價</span>
           </a>
-          <nav className="nav">
-            <a href="#search" className="nav-link active">首頁</a>
-            <a href="#search" className="nav-link">園區名單</a>
-            <a href="#search" className="nav-link">最新爭議</a>
-            <a href="#search" className="nav-link">關於平台</a>
-          </nav>
           <div className="header-actions">
             <span className="mode-badge">{getModeLabel(result?.mode ?? null)}</span>
+            <span className={`mode-badge mode-badge-secondary${(result?.animal_focus ?? animalFocus) ? ' active' : ''}`}>
+              {getSearchModeLabel(result, animalFocus)}
+            </span>
           </div>
         </div>
       </header>
 
-      {/* ── Hero Search ── */}
-      <section className="hero" id="search">
-        <div className="hero-inner">
-          <p className="hero-badge">🛡️ 第三方評論匯整平台</p>
-          <h1 className="hero-title">搜尋動保園區，快速看口碑評價</h1>
-          <p className="hero-subtitle">
-            目前主力整理 Firecrawl 與 PTT 的公開內容，優先顯示可讀的評論、心得與爭議摘錄。
-          </p>
+      {!isEntityRoute ? (
+        <>
+          {/* ── Hero Search ── */}
+          <section className="hero" id="search">
+            <div className="hero-inner">
+              <p className="hero-badge">🛡️ 第三方公開資料搜尋平台</p>
+              <h1 className="hero-title">搜尋動保園區，快速看全網證據</h1>
+              <p className="hero-subtitle">
+                盡可能整理官方、新聞、社群、論壇、Google 與募資相關公開資料，幫你快速掌握爭議與背景。
+              </p>
 
-          <form className="search-form" onSubmit={handleSubmit}>
-            <div className="search-row">
-              <div className="search-field">
-                <label htmlFor="entity-input">查詢對象</label>
-                <input
-                  id="entity-input"
-                  value={entityName}
-                  onChange={(event) => {
-                    const nextValue = event.target.value
-                    setEntityName(nextValue)
-                    void loadEntityOptions(nextValue)
-                  }}
-                  onFocus={() => void loadEntityOptions(entityName)}
-                  placeholder="輸入園區名稱，例如：TSSDA、某某狗園"
-                />
-              </div>
-              <div className="search-field search-field-grow">
-                <label htmlFor="question-input">想查的問題</label>
-                <input
-                  id="question-input"
-                  value={question}
-                  onChange={(event) => setQuestion(event.target.value)}
-                  placeholder="例如：是否有動物福利爭議？"
-                />
-              </div>
-              <button type="submit" className="search-btn" disabled={loading}>
-                {loading ? '搜尋中…' : '開始搜尋'}
-              </button>
-            </div>
+              <form className="search-form" onSubmit={handleSubmit}>
+                <div className="focus-toggle-row">
+                  <button
+                    type="button"
+                    className={`focus-toggle${animalFocus ? ' active' : ''}`}
+                    aria-pressed={animalFocus}
+                    onClick={handleAnimalFocusToggle}
+                  >
+                    動保法模式
+                  </button>
+                  <p className="focus-mode-note">
+                    {animalFocus
+                      ? '只顯示與動物福利、照護、疑似違規或動保法相關的內容'
+                      : '一般模式會保留較廣泛的評價、聲明、新聞與社群資訊'}
+                  </p>
+                </div>
 
-            <div className="quick-tags">
-              {COMMON_QUESTIONS.map((item) => (
-                <button
-                  key={item}
-                  type="button"
-                  className={`quick-tag${question === item ? ' active' : ''}`}
-                  onClick={() => handleQuestionSelect(item)}
-                >
-                  {item}
-                </button>
-              ))}
-            </div>
-
-            {error ? <p className="error-msg">{error}</p> : null}
-
-            {loading ? (
-              <div className="search-loading-panel" aria-live="polite">
-                <div className="loading-pulse-row">
-                  {SEARCH_PROGRESS_STEPS.map((step, index) => (
-                    <span
-                      key={step}
-                      className={`loading-dot${index === searchStepIndex ? ' active' : ''}${index < searchStepIndex ? ' done' : ''}`}
+                <div className="search-row">
+                  <div className="search-field">
+                    <label htmlFor="entity-input">查詢對象</label>
+                    <input
+                      id="entity-input"
+                      value={entityName}
+                      onChange={(event) => {
+                        const nextValue = event.target.value
+                        setEntityName(nextValue)
+                        void loadEntityOptions(nextValue)
+                      }}
+                      onFocus={() => void loadEntityOptions(entityName)}
+                      placeholder="輸入園區名稱，例如：TSSDA、某某狗園"
                     />
+                  </div>
+                  <div className="search-field search-field-grow">
+                    <label htmlFor="question-input">想查的問題</label>
+                    <input
+                      id="question-input"
+                      value={question}
+                      onChange={(event) => setQuestion(event.target.value)}
+                      placeholder={questionPlaceholder}
+                    />
+                  </div>
+                  <button type="submit" className="search-btn" disabled={loading}>
+                    {loading ? '搜尋中…' : '開始搜尋'}
+                  </button>
+                </div>
+
+                <div className="quick-tags">
+                  {quickQuestions.map((item) => (
+                    <button
+                      key={item}
+                      type="button"
+                      className={`quick-tag${question === item ? ' active' : ''}`}
+                      onClick={() => handleQuestionSelect(item)}
+                    >
+                      {item}
+                    </button>
                   ))}
                 </div>
-                <p className="loading-title">搜尋中，正在整理可用證據</p>
-                <p className="loading-detail">{SEARCH_PROGRESS_STEPS[searchStepIndex]}</p>
-              </div>
-            ) : null}
-          </form>
 
-          {entityOptions.length > 0 ? (
-            <div className="suggestion-row">
-              {entityOptions.slice(0, 5).map((item) => (
-                <button
-                  key={item.entity_name}
-                  type="button"
-                  className="suggestion-chip"
-                  onClick={() => handleEntityPick(item)}
-                >
-                  <strong>{item.entity_name}</strong>
-                  <span>{item.total_queries} 次查詢</span>
-                </button>
+                {error ? <p className="error-msg">{error}</p> : null}
+
+                {loading ? (
+                  <div className="search-loading-panel" aria-live="polite">
+                    <div className="loading-pulse-row">
+                      {searchProgressSteps.map((step, index) => (
+                        <span
+                          key={step}
+                          className={`loading-dot${index === searchStepIndex ? ' active' : ''}${index < searchStepIndex ? ' done' : ''}`}
+                        />
+                      ))}
+                    </div>
+                    <p className="loading-title">搜尋中，正在整理可用證據</p>
+                    <p className="loading-detail">{searchProgressSteps[searchStepIndex]}</p>
+                  </div>
+                ) : null}
+
+              </form>
+
+              {entityOptions.length > 0 ? (
+                <div className="suggestion-row">
+                  {entityOptions.slice(0, 5).map((item) => (
+                    <button
+                      key={item.entity_name}
+                      type="button"
+                      className="suggestion-chip"
+                      onClick={() => handleEntityPick(item)}
+                    >
+                      <strong>{item.entity_name}</strong>
+                      <span>{item.total_queries} 次查詢</span>
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+          </section>
+
+          {/* ── Platform Sources ── */}
+          <section className="sources-bar">
+            <div className="sources-inner">
+              <span className="sources-label">資料來源</span>
+              {PLATFORM_LABELS.map((item) => (
+                <span key={item} className="source-pill">{item}</span>
               ))}
             </div>
-          ) : null}
-        </div>
-      </section>
-
-      {/* ── Platform Sources ── */}
-      <section className="sources-bar">
-        <div className="sources-inner">
-          <span className="sources-label">資料來源</span>
-          {PLATFORM_LABELS.map((item) => (
-            <span key={item} className="source-pill">{item}</span>
-          ))}
-        </div>
-      </section>
+          </section>
+        </>
+      ) : null}
 
       {result ? (
         <section className="result-page" ref={resultSectionRef}>
@@ -843,24 +1297,43 @@ function App() {
               <div className="entity-header-top">
                 <div className="entity-header-info">
                   <a href="#search" className="back-link">← 返回搜尋</a>
-                  <h2 className="entity-name">{profile?.entity_name ?? entityName}</h2>
+                  <h2 className="entity-name">
+                    <a
+                      href={buildEntityPath(profile?.entity_name ?? entityName)}
+                      className="entity-name-link"
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      {profile?.entity_name ?? entityName}
+                    </a>
+                  </h2>
                   {profile?.aliases.length ? (
                     <p className="entity-aliases">別名：{profile.aliases.join('、')}</p>
                   ) : null}
+                  <p className={`entity-mode-note${result.animal_focus ? ' active' : ''}`}>
+                    {result.animal_focus
+                      ? '動保法模式已啟用：摘要只聚焦動物福利、照護、收容、繁殖、救援與相關法規風險。'
+                      : '一般模式：保留較廣泛的公開評價、聲明、新聞與社群資訊。'}
+                  </p>
                   <p className="entity-question">🔍 {question}</p>
                 </div>
                 <div className="score-box">
                   <div className="score-number">{toFivePointScore(overallScore)}</div>
                   <div className="score-label">{getOverallLabel(overallScore)}</div>
-                  <div className="score-count">{result.evidence_cards.length} 則來源</div>
+                  <div className="score-count">保留 {result.evidence_cards.length} 則證據</div>
                 </div>
               </div>
 
               <p className="entity-intro">{getIntroParagraph(result)}</p>
 
               <div className="entity-tags">
+                <span className={`entity-tag ${result.animal_focus ? 'tag-animal-mode' : 'tag-general-mode'}`}>
+                  {result.search_mode === 'animal_law' ? '動保法模式' : '一般模式'}
+                </span>
                 <span className="entity-tag">{getReviewTone(result.evidence_cards)}</span>
-                <span className="entity-tag">{getFakePlatformReviewCount(result.evidence_cards)} 則整合評論</span>
+                <span className="entity-tag">{getEvidenceCount(result.evidence_cards)} 則整合證據</span>
+                <span className="entity-tag">原始抓到 {result.diagnostics.raw_merged_results}</span>
+                <span className="entity-tag">過濾後保留 {result.evidence_cards.length}</span>
                 {sourceTypeSummary.map((item) => (
                   <span key={item.type} className={`entity-tag tag-${item.type}`}>
                     {item.label} {item.count}
@@ -928,50 +1401,66 @@ function App() {
               </div>
               <div className="stat-card">
                 <span className="stat-value">{profile?.total_sources ?? result.evidence_cards.length}</span>
-                <span className="stat-label">累積來源</span>
+                <span className="stat-label">歷史累積來源</span>
               </div>
               <div className="stat-card">
-                <span className="stat-value">{profile?.average_confidence ?? result.summary.confidence}</span>
-                <span className="stat-label">平均把握度</span>
+                <span className="stat-value">{result.diagnostics.raw_merged_results}</span>
+                <span className="stat-label">本次原始抓取</span>
               </div>
               <div className="stat-card">
-                <span className="stat-value">{overallScore}</span>
-                <span className="stat-label">綜合可信度</span>
+                <span className="stat-value">{result.evidence_cards.length}</span>
+                <span className="stat-label">本次保留證據</span>
               </div>
             </div>
 
-            {/* ── Reviews Section ── */}
+            {/* ── Evidence Section ── */}
             <div className="reviews-section">
               <div className="reviews-header">
-                <h3>📝 評論與證據（{result.evidence_cards.length}）</h3>
-                <p className="reviews-hint">ⓘ 這裡優先顯示可讀的評論摘錄；空白社群頁與低品質結果已自動過濾</p>
+                <h3>📝 證據列表（{result.evidence_cards.length}）</h3>
+                <p className="reviews-hint">
+                  ⓘ 本次共展開 {result.diagnostics.query_count} 個查詢，原始抓到 {result.diagnostics.raw_merged_results} 筆，
+                  去重後 {result.diagnostics.deduplicated_results} 筆，低品質/不相關過濾掉 {result.diagnostics.low_signal_filtered + result.diagnostics.relevance_filtered}
+                  筆，最後留下 {result.evidence_cards.length} 則可摘要證據。
+                </p>
+                <p className="reviews-hint">
+                  Firecrawl {result.diagnostics.providers.firecrawl_results}、SerpAPI {result.diagnostics.providers.serpapi_results}、
+                  平台來源 {result.diagnostics.providers.platform_results}、歷史快取 {result.diagnostics.providers.cached_results}
+                  。SerpAPI 會抓比較廣，所以也比較容易混入分類頁、導覽頁或弱相關結果，後面仍會被過濾。
+                </p>
+                {result.diagnostics.analysis ? (
+                  <p className="reviews-hint">
+                    分析階段另外排除了 {result.diagnostics.analysis.noise_filtered + result.diagnostics.analysis.low_relevance_filtered}
+                    筆低訊號卡片，AI 灰頁判斷再剔除 {result.diagnostics.analysis.ai_gray_filtered} 筆。
+                  </p>
+                ) : null}
               </div>
 
               <div className="platform-tabs">
                 <button
                   type="button"
-                  className={`ptab${activePlatform === '本平台' ? ' active' : ''}`}
-                  onClick={() => setActivePlatform('本平台')}
+                  className={`ptab${activePlatform === '全部來源' ? ' active' : ''}`}
+                  onClick={() => setActivePlatform('全部來源')}
                 >
-                  本平台 ({result.evidence_cards.length})
+                  全部來源 ({result.evidence_cards.length})
                 </button>
                 {PLATFORM_LABELS.map((label) => {
                   const count = countPlatformCards(result.evidence_cards, label)
+                  if (count === 0) return null
                   return (
                     <button
                       key={label}
                       type="button"
-                      className={`ptab${activePlatform === label ? ' active' : ''}${count === 0 ? ' disabled' : ''}`}
+                      className={`ptab${activePlatform === label ? ' active' : ''}`}
                       onClick={() => setActivePlatform(label)}
                     >
-                      {label}{count > 0 ? ` (${count})` : ''}
+                      {label} ({count})
                     </button>
                   )
                 })}
               </div>
 
               <div className="filter-bar">
-                {reviewFilters.map((filter) => (
+                {evidenceFilters.map((filter) => (
                   <button
                     key={filter}
                     type="button"
@@ -986,7 +1475,7 @@ function App() {
               <div className="review-list">
                 {visibleCards.length === 0 ? (
                   <div className="empty-review-state">
-                    目前這個篩選條件下沒有可顯示的結果，建議切回「全部」或改看其他平台。
+                    目前這個篩選條件下沒有可顯示的來源，建議切回「全部」或改看其他平台。
                   </div>
                 ) : visibleCards.map((card) => (
                   <article className="review-card" key={`${card.url}-${card.title}`}>
@@ -1004,9 +1493,9 @@ function App() {
                     </div>
 
                     <h4 className="review-title">{card.title}</h4>
-                    {card.ai_summary ? <p className="review-summary">{card.ai_summary}</p> : null}
+                    {card.ai_summary ? <p className="review-summary">AI 摘要：{card.ai_summary}</p> : null}
                     <div className="review-excerpt-block">
-                      <span className="review-excerpt-label">相關摘錄</span>
+                      <span className="review-excerpt-label">證據摘錄</span>
                       <p className="review-snippet">{getCardExcerpt(card)}</p>
                     </div>
 
@@ -1036,8 +1525,22 @@ function App() {
             {/* ── Media Upload ── */}
             <div className="media-section">
               <div className="media-header">
-                <h3>📷 上傳證據照片／影片</h3>
-                <p className="media-hint">支援 JPG、PNG、WebP、GIF、HEIC、MP4、MOV、WebM（單檔最大 200MB）</p>
+                <h3>📝 留下評論並上傳附件</h3>
+                <p className="media-hint">先寫下你觀察到的內容，再附上照片或影片。支援 JPG、PNG、WebP、GIF、HEIC、MP4、MOV、WebM（單檔最大 200MB）</p>
+              </div>
+
+              <div className="upload-caption-row">
+                <label className="upload-form-label" htmlFor="upload-comment-input">
+                  評論內容
+                </label>
+                <textarea
+                  id="upload-comment-input"
+                  className="caption-input comment-input"
+                  value={uploadComment}
+                  onChange={(e) => setUploadComment(e.target.value)}
+                  placeholder="例如：今天看到欄舍潮濕、有異味，動物活動空間偏小。也可以補充時間、地點與觀察到的情況。"
+                />
+                <p className="upload-form-hint">可先填評論，再拖拉照片／影片上傳；評論會一起附在這批檔案上。</p>
               </div>
 
               <div
@@ -1058,17 +1561,8 @@ function App() {
                 <div className="dropzone-content">
                   <span className="dropzone-icon">📁</span>
                   <p className="dropzone-text">拖拉檔案到此區域，或<strong>點擊選擇檔案</strong></p>
-                  <p className="dropzone-sub">可一次選取多個檔案</p>
+                  <p className="dropzone-sub">可一次選取多個檔案，並把上方評論一起附上</p>
                 </div>
-              </div>
-
-              <div className="upload-caption-row">
-                <input
-                  className="caption-input"
-                  value={uploadCaption}
-                  onChange={(e) => setUploadCaption(e.target.value)}
-                  placeholder="備註說明（選填），例如：園區環境照"
-                />
               </div>
 
               {/* Upload Queue */}
@@ -1121,7 +1615,8 @@ function App() {
                         )}
                         <div className="gallery-info">
                           <span className="gallery-name" title={mf.original_name}>{mf.original_name}</span>
-                          <span className="gallery-meta">{formatFileSize(mf.file_size)}{mf.caption ? ` · ${mf.caption}` : ''}</span>
+                          <span className="gallery-meta">{formatFileSize(mf.file_size)}</span>
+                          {mf.caption ? <p className="gallery-comment">{mf.caption}</p> : null}
                         </div>
                       </div>
                     ))}
@@ -1156,12 +1651,440 @@ function App() {
             ) : null}
           </div>
         </section>
+      ) : isEntityRoute ? (
+        <section className="result-page" ref={resultSectionRef}>
+          <div className="result-container">
+            <div className="entity-header-card entity-page-card">
+              <div className="entity-header-top">
+                <div className="entity-header-info">
+                  <button type="button" className="back-link back-link-button" onClick={() => navigateToRoute({ name: 'home' }, true)}>
+                    ← 返回搜尋首頁
+                  </button>
+                  <p className="entity-page-kicker">Entity Page</p>
+                  <h2 className="entity-name">{selectedEntityLabel}</h2>
+                  {(entityPageData?.aliases.length ?? profile?.aliases.length ?? 0) > 0 ? (
+                    <p className="entity-aliases">別名：{(entityPageData?.aliases ?? profile?.aliases ?? []).join('、')}</p>
+                  ) : null}
+                  {entityPageData?.headline ? <p className="entity-page-headline">{entityPageData.headline}</p> : null}
+                  <p className={`entity-mode-note${animalFocus ? ' active' : ''}`}>
+                    {animalFocus
+                      ? '目前正在看動保法模式的摘要與待查問題。'
+                      : '目前正在看一般模式的整理摘要，可切換成動保法模式查看更聚焦的內容。'}
+                  </p>
+                </div>
+                <div className="score-box">
+                  <div className="score-number">{toFivePointScore(entityPageScore)}</div>
+                  <div className="score-label">{entitySnapshot ? '資料庫摘要' : '尚待建立'}</div>
+                  <div className="score-count">{entitySnapshot ? `${entitySnapshot.source_count} 則整理證據` : '先建立第一筆摘要'}</div>
+                </div>
+              </div>
+
+              <div className="entity-page-hero">
+                <div className="entity-page-copy">
+                  <p className="entity-intro">
+                    {entityPageData?.introduction
+                      ? entityPageData.introduction
+                      : entitySnapshot
+                        ? entitySnapshot.summary.verdict
+                        : '目前這個實體還沒有資料庫摘要，你可以直接用上方搜尋建立第一筆整理結果。'}
+                  </p>
+                  {entityPageData?.location ? <p className="entity-page-location">📍 {entityPageData.location}</p> : null}
+                </div>
+                {entityPageData?.cover_image_url && !hiddenBrokenImages[entityPageData.cover_image_url] ? (
+                  <img
+                    src={entityPageData.cover_image_url}
+                    alt={entityPageData.cover_image_alt || `${selectedEntityLabel} 介紹圖片`}
+                    className="entity-page-cover"
+                    loading="lazy"
+                    referrerPolicy="no-referrer"
+                    onError={() => {
+                      setHiddenBrokenImages((prev) => ({ ...prev, [entityPageData.cover_image_url]: true }))
+                    }}
+                  />
+                ) : null}
+              </div>
+
+              <div className="entity-tags">
+                <span className={`entity-tag ${animalFocus ? 'tag-animal-mode' : 'tag-general-mode'}`}>
+                  {animalFocus ? '動保法模式' : '一般模式'}
+                </span>
+                {entitySnapshot ? <span className="entity-tag">{entitySnapshot.source_count} 則已整理證據</span> : null}
+                {profile ? <span className="entity-tag">累積查詢 {profile.total_queries}</span> : null}
+                {entityPageData ? <span className="entity-tag">累積評論 {entityPageData.total_comments}</span> : null}
+                {entityPageSourceSummary.map((item) => (
+                  <span key={item.type} className={`entity-tag tag-${item.type}`}>
+                    {item.label} {item.count}
+                  </span>
+                ))}
+              </div>
+
+              <div className="entity-page-actions">
+                <button
+                  type="button"
+                  className="search-btn"
+                  onClick={() => {
+                    navigateToRoute({ name: 'home' }, true)
+                    requestAnimationFrame(() => {
+                      document.getElementById('search')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+                    })
+                  }}
+                >
+                  用這個實體開始搜尋
+                </button>
+              </div>
+            </div>
+
+            {entityPageLoading ? (
+              <div className="empty-card entity-page-empty">
+                <div className="empty-icon">🧭</div>
+                <h2>正在載入實體頁資料</h2>
+                <p>正在整理介紹、圖片、評論、媒體檔案與歷史查詢紀錄。</p>
+              </div>
+            ) : null}
+
+            {!entityPageLoading && entityPageData?.gallery.length ? (
+              <div className="summary-card entity-gallery-section">
+                <div className="reviews-header">
+                  <h3>🖼️ 實體介紹圖片</h3>
+                  <p className="reviews-hint">這裡會先顯示資料庫內建的介紹圖片，之後也可以持續搭配下方附件一起觀察。</p>
+                </div>
+                <div className="entity-gallery-grid">
+                  {entityPageData.gallery.filter((item) => !hiddenBrokenImages[item.url]).map((item) => (
+                    <figure key={`${item.url}-${item.caption}`} className="entity-gallery-card">
+                      <img
+                        src={item.url}
+                        alt={item.alt_text || `${selectedEntityLabel} 圖片`}
+                        className="entity-gallery-image"
+                        loading="lazy"
+                        referrerPolicy="no-referrer"
+                        onError={() => {
+                          setHiddenBrokenImages((prev) => ({ ...prev, [item.url]: true }))
+                        }}
+                      />
+                      {item.caption || item.source_page_url ? (
+                        <figcaption className="entity-gallery-caption">
+                          {item.caption ? <span>{item.caption}</span> : null}
+                          {item.source_page_url ? (
+                            <a
+                              href={item.source_page_url}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="entity-gallery-source-link"
+                            >
+                              查看來源頁 ↗
+                            </a>
+                          ) : null}
+                        </figcaption>
+                      ) : null}
+                    </figure>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+
+            {!entityPageLoading && entitySnapshot ? (
+              <>
+                <div className="summary-grid">
+                  <div className="summary-card">
+                    <h3>📌 資料庫摘要</h3>
+                    <p className="summary-caption">最近更新：{formatDateTimeLabel(entitySnapshot.generated_at)}</p>
+                    <p className="entity-overview-hint">{entitySnapshot.summary.verdict}</p>
+                  </div>
+                  <div className="summary-card">
+                    <h3>⚠️ 主要疑慮</h3>
+                    <ul className="point-list">
+                      {entitySnapshot.summary.supporting_points.slice(0, 3).map((item) => (
+                        <li key={item} className="point-item concern">{item}</li>
+                      ))}
+                    </ul>
+                  </div>
+                  <div className="summary-card">
+                    <h3>✅ 正面資訊</h3>
+                    <ul className="point-list">
+                      {entitySnapshot.summary.opposing_points.slice(0, 3).map((item) => (
+                        <li key={item} className="point-item positive">{item}</li>
+                      ))}
+                    </ul>
+                  </div>
+                  <div className="summary-card">
+                    <h3>❓ 待查證</h3>
+                    <ul className="point-list">
+                      {entitySnapshot.summary.uncertain_points.slice(0, 3).map((item) => (
+                        <li key={item} className="point-item uncertain">{item}</li>
+                      ))}
+                    </ul>
+                  </div>
+                </div>
+
+                {entityQuestions.length > 0 ? (
+                  <div className="summary-card entity-question-section">
+                    <h3>🧠 建議追問</h3>
+                    <p className="summary-caption">點一下就會帶回搜尋區，直接用這個實體開始查。</p>
+                    <div className="entity-question-grid">
+                      {entityQuestions.slice(0, 8).map((item) => (
+                        <button
+                          key={`${item.category}-${item.question_text}`}
+                          type="button"
+                          className="entity-question-card"
+                          onClick={() => {
+                            setQuestion(item.question_text)
+                            navigateToRoute({ name: 'home' }, true)
+                            requestAnimationFrame(() => {
+                              document.getElementById('search')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+                            })
+                          }}
+                        >
+                          <span className="entity-question-category">{item.category}</span>
+                          <strong>{item.question_text}</strong>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+
+                <div className="reviews-section">
+                  <div className="reviews-header">
+                    <h3>📝 已整理證據（{entitySnapshot.evidence_cards.length}）</h3>
+                    <p className="reviews-hint">以下優先顯示資料庫已整理好的證據卡，可直接當成這個實體頁的快速入口。</p>
+                  </div>
+                  <div className="platform-tabs">
+                    <button
+                      type="button"
+                      className={`ptab${activePlatform === '全部來源' ? ' active' : ''}`}
+                      onClick={() => setActivePlatform('全部來源')}
+                    >
+                      全部來源 ({entitySnapshot.evidence_cards.length})
+                    </button>
+                    {PLATFORM_LABELS.map((label) => {
+                      const count = countPlatformCards(entitySnapshot.evidence_cards, label)
+                      if (count === 0) return null
+                      return (
+                        <button
+                          key={label}
+                          type="button"
+                          className={`ptab${activePlatform === label ? ' active' : ''}`}
+                          onClick={() => setActivePlatform(label)}
+                        >
+                          {label} ({count})
+                        </button>
+                      )
+                    })}
+                  </div>
+                  <div className="filter-bar">
+                    {evidenceFilters.map((filter) => (
+                      <button
+                        key={filter}
+                        type="button"
+                        className={`filter-chip${activeFilter === filter ? ' active' : ''}`}
+                        onClick={() => setActiveFilter(filter)}
+                      >
+                        {filter} ({getFilterCount(filter, entityPagePlatformCards)})
+                      </button>
+                    ))}
+                  </div>
+                  <div className="review-list">
+                    {entityPageVisibleCards.length === 0 ? (
+                      <div className="empty-review-state">目前這個篩選條件下沒有可顯示的資料庫證據卡。</div>
+                    ) : entityPageVisibleCards.map((card) => (
+                      <article className="review-card" key={`${card.url}-${card.title}`}>
+                        <div className="review-top">
+                          <div className="review-avatar">{card.source.slice(0, 1).toUpperCase()}</div>
+                          <div className="review-meta">
+                            <span className="review-source-name">{card.source}</span>
+                            <span className="review-date">{getPublishedDateLabel(card)}</span>
+                          </div>
+                          <div className="review-badges">
+                            <span className={`stance-badge stance-${card.stance}`}>{getStanceLabel(card.stance)}</span>
+                            <span className={`type-badge type-${card.source_type}`}>{getSourceTypeLabel(card.source_type)}</span>
+                          </div>
+                        </div>
+                        <h4 className="review-title">{card.title}</h4>
+                        <p className="review-snippet">{getCardExcerpt(card)}</p>
+                        <div className="review-footer">
+                          <span className="review-url">{new URL(card.url).hostname}</span>
+                          <a href={card.url} target="_blank" rel="noreferrer" className="view-original">
+                            查看原文 →
+                          </a>
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                </div>
+              </>
+            ) : null}
+
+            {!entityPageLoading && entityPageError ? (
+              <div className="empty-card entity-page-empty">
+                <div className="empty-icon">📭</div>
+                <h2>這個實體頁還沒有完整資料</h2>
+                <p>{entityPageError}</p>
+              </div>
+            ) : null}
+
+            <div className="reviews-section comment-section">
+              <div className="reviews-header">
+                <h3>💬 累積評論（{entityPageData?.total_comments ?? 0}）</h3>
+                <p className="reviews-hint">這裡會持續累積針對這個實體的觀察評論，可單獨送出，也可搭配下方附件一起補充。</p>
+              </div>
+              {entityPageData?.comments.length ? (
+                <div className="entity-comment-list">
+                  {entityPageData.comments.map((item) => (
+                    <article key={item.id} className="entity-comment-card">
+                      <div className="entity-comment-top">
+                        <strong>{item.entity_name}</strong>
+                        <span>{formatDateTimeLabel(item.created_at)}</span>
+                      </div>
+                      <p className="entity-comment-body">{item.comment}</p>
+                    </article>
+                  ))}
+                </div>
+              ) : (
+                <div className="empty-review-state">目前還沒有評論，歡迎成為第一位留下觀察的人。</div>
+              )}
+            </div>
+
+            <div className="media-section">
+              <div className="media-header">
+                <h3>📝 留下評論並上傳附件</h3>
+                <p className="media-hint">先寫下你觀察到的內容，再選擇單獨送出評論，或附上照片/影片。支援 JPG、PNG、WebP、GIF、HEIC、MP4、MOV、WebM（單檔最大 200MB）</p>
+              </div>
+
+              <div className="upload-caption-row">
+                <label className="upload-form-label" htmlFor="upload-comment-input">
+                  評論內容
+                </label>
+                <textarea
+                  id="upload-comment-input"
+                  className="caption-input comment-input"
+                  value={uploadComment}
+                  onChange={(e) => setUploadComment(e.target.value)}
+                  placeholder="例如：今天看到欄舍潮濕、有異味，動物活動空間偏小。也可以補充時間、地點與觀察到的情況。"
+                />
+                <div className="comment-action-row">
+                  <button
+                    type="button"
+                    className="search-btn comment-submit-btn"
+                    onClick={() => void handleCommentSubmit()}
+                    disabled={commentSubmitting}
+                  >
+                    {commentSubmitting ? '送出中…' : '先送出評論'}
+                  </button>
+                  <p className="upload-form-hint">你也可以不傳檔案，先單獨送出評論；若接著上傳附件，會自動沿用這段評論一起存進實體頁。</p>
+                </div>
+                {commentError ? <p className="comment-error-text">{commentError}</p> : null}
+              </div>
+
+              <div
+                className={`upload-dropzone${isDragging ? ' dragging' : ''}`}
+                onDragOver={handleDragOver}
+                onDragLeave={handleDragLeave}
+                onDrop={handleDrop}
+                onClick={() => fileInputRef.current?.click()}
+              >
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="image/*,video/*"
+                  multiple
+                  hidden
+                  onChange={handleFileInputChange}
+                />
+                <div className="dropzone-content">
+                  <span className="dropzone-icon">📁</span>
+                  <p className="dropzone-text">拖拉檔案到此區域，或<strong>點擊選擇檔案</strong></p>
+                  <p className="dropzone-sub">可一次選取多個檔案；若上方已有評論，會先新增到此實體的累積評論區</p>
+                </div>
+              </div>
+
+              {uploadQueue.length > 0 && (
+                <div className="upload-queue">
+                  <div className="queue-header">
+                    <span>上傳佇列（{uploadQueue.length}）</span>
+                    <button type="button" className="clear-done-btn" onClick={clearCompletedUploads}>清除已完成</button>
+                  </div>
+                  {uploadQueue.map((item, idx) => (
+                    <div key={`${item.file.name}-${idx}`} className="queue-item">
+                      <span className="queue-name">{item.file.name}</span>
+                      <span className="queue-size">{formatFileSize(item.file.size)}</span>
+                      <div className="queue-progress-bar">
+                        <div
+                          className={`queue-progress-fill ${item.status}`}
+                          style={{ width: `${item.progress}%` }}
+                        />
+                      </div>
+                      <span className={`queue-status ${item.status}`}>
+                        {item.status === 'pending' && '等待中'}
+                        {item.status === 'uploading' && `${item.progress}%`}
+                        {item.status === 'done' && '✓ 完成'}
+                        {item.status === 'error' && `✗ ${item.errorMsg ?? '失敗'}`}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {mediaFiles.length > 0 && (
+                <div className="media-gallery">
+                  <h4>已上傳的檔案（{mediaFiles.length}）</h4>
+                  <div className="gallery-grid">
+                    {mediaFiles.map((mf) => (
+                      <div key={mf.id} className="gallery-item">
+                        {mf.media_type === 'image' ? (
+                          <img
+                            src={`${API_BASE_URL}${mf.url}`}
+                            alt={mf.original_name}
+                            className="gallery-thumb"
+                            loading="lazy"
+                          />
+                        ) : (
+                          <div className="gallery-video-thumb">
+                            <span className="video-icon">🎬</span>
+                            <span>{mf.original_name}</span>
+                          </div>
+                        )}
+                        <div className="gallery-info">
+                          <span className="gallery-name" title={mf.original_name}>{mf.original_name}</span>
+                          <span className="gallery-meta">{formatFileSize(mf.file_size)}</span>
+                          {mf.caption ? <p className="gallery-comment">{mf.caption}</p> : null}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {mediaFiles.length === 0 && uploadQueue.length === 0 ? (
+                <button
+                  type="button"
+                  className="load-media-btn"
+                  onClick={() => void loadMediaFiles(selectedEntityLabel)}
+                >
+                  載入已上傳的檔案
+                </button>
+              ) : null}
+            </div>
+
+            {profile ? (
+              <div className="history-section">
+                <h3>🕐 近期查詢紀錄</h3>
+                <div className="history-list">
+                  {profile.recent_queries.map((item) => (
+                    <div key={item.query_id} className="history-item">
+                      <strong>{item.question}</strong>
+                      <span>{formatDateTimeLabel(item.created_at)} · {getModeLabel(item.mode)} · 把握度 {item.confidence}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+          </div>
+        </section>
       ) : (
         <section className="empty-state" ref={resultSectionRef}>
-          <div className="empty-card">
-            <div className="empty-icon">🔍</div>
-            <h2>輸入園區名稱開始查詢</h2>
-            <p>搜尋後將顯示全網評價匯總、AI 分析摘要、以及完整證據列表。</p>
+            <div className="empty-card">
+              <div className="empty-icon">🔍</div>
+              <h2>輸入園區名稱開始查詢</h2>
+            <p>搜尋後將顯示全網公開資料摘要、AI 分析重點，以及完整證據列表。</p>
           </div>
         </section>
       )}
@@ -1169,8 +2092,8 @@ function App() {
       {/* ── Footer ── */}
       <footer className="footer">
         <div className="footer-inner">
-          <span>© 2026 動保評價 — 動物福利評論匯整平台</span>
-          <span>資料來源：Google、Facebook、PTT、Dcard、新聞媒體等公開平台</span>
+          <span>© 2026 動保評價 — 動物福利公開資料搜尋平台</span>
+          <span>資料來源：Google、Facebook、PTT、Dcard、新聞、官方網站與其他公開平台</span>
         </div>
       </footer>
     </div>

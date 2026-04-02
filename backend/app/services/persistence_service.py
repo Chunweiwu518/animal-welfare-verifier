@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from pathlib import Path
@@ -7,13 +8,21 @@ from pathlib import Path
 from app.config import Settings
 from app.models.media import MediaFileResponse, MediaListResponse, MediaStatsResponse
 from app.models.profile import (
+    EntityCommentResponse,
+    EntityPageImageItem,
+    EntityPageResponse,
+    EntityQuestionSuggestionItem,
+    EntityQuestionSuggestionsResponse,
     EntityListItem,
     EntityListResponse,
     EntityProfileResponse,
+    EntitySummarySnapshotResponse,
     RecentQueryItem,
     SourceBreakdownItem,
 )
 from app.models.search import BalancedSummary, EvidenceCard
+from app.models.watchlist import WatchlistEntity
+from app.seed_data import ENTITY_PAGE_SEED, WATCHLIST_SEED, question_templates_for
 
 
 class PersistenceService:
@@ -44,6 +53,8 @@ class PersistenceService:
                     normalized_question TEXT NOT NULL,
                     expanded_queries_json TEXT NOT NULL,
                     mode TEXT NOT NULL,
+                    search_mode TEXT NOT NULL DEFAULT 'general',
+                    animal_focus INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (entity_id) REFERENCES entities(id)
                 );
@@ -123,9 +134,106 @@ class PersistenceService:
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
 
+                CREATE TABLE IF NOT EXISTS entity_watchlists (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    entity_id INTEGER NOT NULL UNIQUE,
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    priority INTEGER NOT NULL DEFAULT 3,
+                    refresh_interval_hours INTEGER NOT NULL DEFAULT 24,
+                    default_mode TEXT NOT NULL DEFAULT 'general',
+                    last_crawled_at TEXT,
+                    next_crawl_at TEXT,
+                    last_success_at TEXT,
+                    last_error_at TEXT,
+                    last_error_message TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (entity_id) REFERENCES entities(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS entity_keywords (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    entity_id INTEGER NOT NULL,
+                    keyword TEXT NOT NULL,
+                    keyword_type TEXT NOT NULL DEFAULT 'alias',
+                    weight INTEGER NOT NULL DEFAULT 50,
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(entity_id, keyword),
+                    FOREIGN KEY (entity_id) REFERENCES entities(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS entity_summary_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    entity_id INTEGER NOT NULL,
+                    mode TEXT NOT NULL,
+                    snapshot_hash TEXT NOT NULL DEFAULT '',
+                    summary_json TEXT NOT NULL,
+                    evidence_cards_json TEXT NOT NULL,
+                    source_window_days INTEGER NOT NULL DEFAULT 30,
+                    source_count INTEGER NOT NULL DEFAULT 0,
+                    latest_query_id INTEGER,
+                    generated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(entity_id, mode, snapshot_hash),
+                    FOREIGN KEY (entity_id) REFERENCES entities(id),
+                    FOREIGN KEY (latest_query_id) REFERENCES search_queries(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS entity_question_suggestions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    entity_id INTEGER NOT NULL,
+                    mode TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    question_text TEXT NOT NULL,
+                    confidence_score INTEGER NOT NULL DEFAULT 70,
+                    generated_from TEXT NOT NULL DEFAULT 'seed',
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(entity_id, mode, category, question_text),
+                    FOREIGN KEY (entity_id) REFERENCES entities(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS entity_page_profiles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    entity_id INTEGER NOT NULL UNIQUE,
+                    headline TEXT NOT NULL DEFAULT '',
+                    introduction TEXT NOT NULL DEFAULT '',
+                    location TEXT NOT NULL DEFAULT '',
+                    cover_image_url TEXT NOT NULL DEFAULT '',
+                    cover_image_alt TEXT NOT NULL DEFAULT '',
+                    gallery_json TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (entity_id) REFERENCES entities(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS entity_comments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    entity_id INTEGER NOT NULL,
+                    comment TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (entity_id) REFERENCES entities(id)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_media_entity ON media_files(entity_name);
+                CREATE INDEX IF NOT EXISTS idx_snapshots_entity_mode ON entity_summary_snapshots(entity_id, mode);
+                CREATE INDEX IF NOT EXISTS idx_question_suggestions_entity_mode ON entity_question_suggestions(entity_id, mode, is_active);
+                CREATE INDEX IF NOT EXISTS idx_entity_comments_entity_id ON entity_comments(entity_id, id DESC);
                 """
             )
+            self._ensure_entity_summary_snapshot_history(connection)
+            self._ensure_search_query_columns(connection)
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_snapshots_entity_mode ON entity_summary_snapshots(entity_id, mode, generated_at DESC)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_search_queries_entity_mode ON search_queries(entity_id, search_mode, created_at DESC)"
+            )
+            if self.settings.bootstrap_seed_watchlist:
+                self._bootstrap_builtin_watchlist(connection)
 
     def save_search_run(
         self,
@@ -133,12 +241,22 @@ class PersistenceService:
         question: str,
         expanded_queries: list[str],
         mode: str,
+        search_mode: str,
+        animal_focus: bool,
         summary: BalancedSummary,
         evidence_cards: list[EvidenceCard],
     ) -> int:
         with self._connect() as connection:
             entity_id = self._upsert_entity(connection, entity_name)
-            query_id = self._insert_query(connection, entity_id, question, expanded_queries, mode)
+            query_id = self._insert_query(
+                connection,
+                entity_id,
+                question,
+                expanded_queries,
+                mode,
+                search_mode,
+                animal_focus,
+            )
             self._insert_summary(connection, query_id, summary)
 
             for card in evidence_cards:
@@ -266,6 +384,101 @@ class PersistenceService:
             for row in rows
         }
 
+    def find_relevant_cached_sources(
+        self,
+        entity_name: str,
+        question: str,
+        expanded_queries: list[str],
+        limit: int = 12,
+        search_mode: str | None = None,
+    ) -> list[dict[str, str | None]]:
+        search_terms = self._build_cached_source_terms(entity_name, question, expanded_queries)
+        if not search_terms:
+            return []
+
+        conditions = ["(raw_title LIKE ? OR raw_content LIKE ? OR url LIKE ?)" for _ in search_terms]
+        params: list[str] = []
+        for term in search_terms:
+            like = f"%{term}%"
+            params.extend([like, like, like])
+
+        with self._connect() as connection:
+            entity_row = self._find_entity_by_name_or_alias(connection, entity_name)
+            if not entity_row:
+                return []
+
+            mode_clause = "AND q.search_mode = ?" if search_mode else ""
+            mode_params = [search_mode] if search_mode else []
+            query = f"""
+                SELECT
+                    s.url,
+                    s.site_name,
+                    s.source_type,
+                    s.author,
+                    s.published_at,
+                    s.fetched_at,
+                    s.raw_title,
+                    s.raw_content,
+                    MAX(ec.relevance_score) AS max_relevance_score,
+                    MAX(ec.credibility_score) AS max_credibility_score,
+                    MAX(q.id) AS latest_query_id
+                FROM sources s
+                JOIN evidence_cards ec ON ec.source_id = s.id
+                JOIN search_queries q ON q.id = ec.query_id
+                WHERE q.entity_id = ?
+                  {mode_clause}
+                  AND ({" OR ".join(conditions)})
+                GROUP BY s.id, s.url, s.site_name, s.source_type, s.author, s.published_at, s.fetched_at, s.raw_title, s.raw_content
+                ORDER BY max_relevance_score DESC, max_credibility_score DESC, latest_query_id DESC, s.updated_at DESC, s.published_at DESC
+                LIMIT ?
+            """
+            rows = connection.execute(
+                query,
+                [int(entity_row["id"]), *mode_params, *params, max(1, limit * 3)],
+            ).fetchall()
+
+        aliases = self._load_aliases(entity_row["alias_json"])
+        exact_terms = [
+            term.lower()
+            for candidate in [str(entity_row["name"]), *aliases, entity_name]
+            for term in self._build_exact_entity_terms(candidate)
+        ]
+        question_terms = [term.lower() for term in self._extract_question_terms(question)]
+        results: list[dict[str, str | None]] = []
+        seen_urls: set[str] = set()
+        for row in rows:
+            url = str(row["url"] or "").strip()
+            if not url or url in seen_urls:
+                continue
+            haystack = " ".join(
+                [
+                    str(row["raw_title"] or ""),
+                    str(row["raw_content"] or ""),
+                    str(row["site_name"] or ""),
+                    url,
+                ]
+            ).lower()
+            entity_match = any(term in haystack for term in exact_terms)
+            question_match = not question_terms or any(term in haystack for term in question_terms)
+            if not entity_match or not question_match:
+                continue
+            seen_urls.add(url)
+            results.append(
+                {
+                    "url": url,
+                    "title": str(row["raw_title"]) if row["raw_title"] is not None else None,
+                    "content": str(row["raw_content"]) if row["raw_content"] is not None else None,
+                    "source": str(row["site_name"]) if row["site_name"] is not None else None,
+                    "source_type": str(row["source_type"]) if row["source_type"] is not None else None,
+                    "author": str(row["author"]) if row["author"] is not None else None,
+                    "published_date": str(row["published_at"]) if row["published_at"] is not None else None,
+                    "fetched_at": str(row["fetched_at"]) if row["fetched_at"] is not None else None,
+                }
+            )
+            if len(results) >= limit:
+                break
+        return results
+
     def get_entity_profile(self, entity_name: str) -> EntityProfileResponse | None:
         with self._connect() as connection:
             entity_row = self._find_entity_by_name_or_alias(connection, entity_name)
@@ -339,6 +552,537 @@ class PersistenceService:
                 ],
             )
 
+    def get_entity_page(self, entity_name: str, media_limit: int = 12, comment_limit: int = 50) -> EntityPageResponse | None:
+        with self._connect() as connection:
+            entity_row = self._find_entity_by_name_or_alias(connection, entity_name)
+            if not entity_row:
+                return None
+
+            entity_id = int(entity_row["id"])
+            canonical_name = str(entity_row["name"])
+            page_row = connection.execute(
+                "SELECT * FROM entity_page_profiles WHERE entity_id = ?",
+                (entity_id,),
+            ).fetchone()
+            comment_rows = connection.execute(
+                """
+                SELECT id, comment, created_at
+                FROM entity_comments
+                WHERE entity_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (entity_id, max(1, comment_limit)),
+            ).fetchall()
+            total_comments_row = connection.execute(
+                "SELECT COUNT(*) AS cnt FROM entity_comments WHERE entity_id = ?",
+                (entity_id,),
+            ).fetchone()
+            media_rows = connection.execute(
+                """
+                SELECT *
+                FROM media_files
+                WHERE entity_name = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (canonical_name, max(1, media_limit)),
+            ).fetchall()
+
+            headline, introduction, location, cover_image_url, cover_image_alt, gallery = self._build_entity_page_content(
+                entity_name=canonical_name,
+                entity_type=str(entity_row["entity_type"] or "organization"),
+                page_row=page_row,
+            )
+
+            return EntityPageResponse(
+                entity_name=canonical_name,
+                entity_type=str(entity_row["entity_type"] or "organization"),
+                aliases=self._load_aliases(entity_row["alias_json"]),
+                headline=headline,
+                introduction=introduction,
+                location=location,
+                cover_image_url=cover_image_url,
+                cover_image_alt=cover_image_alt,
+                gallery=gallery,
+                total_comments=int(total_comments_row["cnt"] or 0) if total_comments_row else 0,
+                comments=[
+                    EntityCommentResponse(
+                        id=int(row["id"]),
+                        entity_name=canonical_name,
+                        comment=str(row["comment"]),
+                        created_at=str(row["created_at"]),
+                    )
+                    for row in comment_rows
+                ],
+                recent_media=[self._row_to_media_response(row) for row in media_rows],
+            )
+
+    def save_entity_comment(self, entity_name: str, comment: str) -> EntityCommentResponse:
+        normalized_comment = comment.strip()
+        if not normalized_comment:
+            raise ValueError("comment cannot be empty")
+
+        with self._connect() as connection:
+            entity_id = self._upsert_entity(connection, entity_name)
+            entity_row = connection.execute(
+                "SELECT name FROM entities WHERE id = ?",
+                (entity_id,),
+            ).fetchone()
+            cursor = connection.execute(
+                "INSERT INTO entity_comments (entity_id, comment) VALUES (?, ?)",
+                (entity_id, normalized_comment),
+            )
+            comment_row = connection.execute(
+                "SELECT id, created_at FROM entity_comments WHERE id = ?",
+                (cursor.lastrowid,),
+            ).fetchone()
+            connection.commit()
+
+            return EntityCommentResponse(
+                id=int(comment_row["id"]),
+                entity_name=str(entity_row["name"]),
+                comment=normalized_comment,
+                created_at=str(comment_row["created_at"]),
+            )
+
+    def upsert_entity_page_images(
+        self,
+        entity_name: str,
+        cover_image_url: str,
+        cover_image_alt: str,
+        gallery: list[EntityPageImageItem],
+        headline: str = "",
+        introduction: str = "",
+        replace_gallery: bool = False,
+    ) -> None:
+        normalized_gallery = [item.model_dump() for item in gallery if item.url.strip()]
+        normalized_headline = headline.strip()
+        normalized_introduction = introduction.strip()
+        should_update_gallery = bool(normalized_gallery) or replace_gallery
+        if not normalized_gallery and not normalized_headline and not normalized_introduction and not should_update_gallery:
+            return
+
+        with self._connect() as connection:
+            entity_id = self._upsert_entity(connection, entity_name)
+            connection.execute(
+                """
+                INSERT INTO entity_page_profiles (
+                    entity_id,
+                    headline,
+                    introduction,
+                    location,
+                    cover_image_url,
+                    cover_image_alt,
+                    gallery_json,
+                    updated_at
+                ) VALUES (
+                    ?,
+                    ?,
+                    ?,
+                    COALESCE((SELECT location FROM entity_page_profiles WHERE entity_id = ?), ''),
+                    ?,
+                    ?,
+                    ?,
+                    CURRENT_TIMESTAMP
+                )
+                ON CONFLICT(entity_id) DO UPDATE SET
+                    headline = CASE
+                        WHEN TRIM(entity_page_profiles.headline) = '' AND TRIM(excluded.headline) <> ''
+                        THEN excluded.headline
+                        ELSE entity_page_profiles.headline
+                    END,
+                    introduction = CASE
+                        WHEN TRIM(entity_page_profiles.introduction) = '' AND TRIM(excluded.introduction) <> ''
+                        THEN excluded.introduction
+                        ELSE entity_page_profiles.introduction
+                    END,
+                    cover_image_url = CASE
+                        WHEN ? = 1 THEN excluded.cover_image_url
+                        ELSE entity_page_profiles.cover_image_url
+                    END,
+                    cover_image_alt = CASE
+                        WHEN ? = 1 THEN excluded.cover_image_alt
+                        ELSE entity_page_profiles.cover_image_alt
+                    END,
+                    gallery_json = CASE
+                        WHEN ? = 1 THEN excluded.gallery_json
+                        ELSE entity_page_profiles.gallery_json
+                    END,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    entity_id,
+                    normalized_headline,
+                    normalized_introduction,
+                    entity_id,
+                    cover_image_url.strip(),
+                    cover_image_alt.strip(),
+                    json.dumps(normalized_gallery, ensure_ascii=False),
+                    1 if should_update_gallery else 0,
+                    1 if should_update_gallery else 0,
+                    1 if should_update_gallery else 0,
+                ),
+            )
+            connection.commit()
+
+    def get_cached_query_result(
+        self,
+        entity_name: str,
+        question: str,
+        search_mode: str,
+        max_age_hours: int,
+    ) -> dict[str, object] | None:
+        with self._connect() as connection:
+            entity_row = self._find_entity_by_name_or_alias(connection, entity_name)
+            if not entity_row:
+                return None
+
+            row = connection.execute(
+                """
+                SELECT
+                    q.id AS query_id,
+                    q.mode,
+                    q.search_mode,
+                    q.animal_focus,
+                    q.expanded_queries_json,
+                    q.created_at,
+                    qs.verdict,
+                    qs.confidence,
+                    qs.supporting_points_json,
+                    qs.opposing_points_json,
+                    qs.uncertain_points_json,
+                    qs.suggested_follow_up_json
+                FROM search_queries q
+                JOIN query_summaries qs ON qs.query_id = q.id
+                WHERE q.entity_id = ?
+                  AND q.normalized_question = ?
+                  AND q.search_mode = ?
+                  AND q.created_at >= datetime('now', ?)
+                ORDER BY q.id DESC
+                LIMIT 1
+                """,
+                (
+                    int(entity_row["id"]),
+                    question.strip().lower(),
+                    search_mode,
+                    f"-{max(1, max_age_hours)} hours",
+                ),
+            ).fetchone()
+            if not row:
+                return None
+
+            summary = BalancedSummary(
+                verdict=str(row["verdict"]),
+                confidence=int(row["confidence"] or 0),
+                supporting_points=self._load_string_list(row["supporting_points_json"]),
+                opposing_points=self._load_string_list(row["opposing_points_json"]),
+                uncertain_points=self._load_string_list(row["uncertain_points_json"]),
+                suggested_follow_up=self._load_string_list(row["suggested_follow_up_json"]),
+            )
+            evidence_cards = self._load_evidence_cards_for_query(connection, int(row["query_id"]))
+            return {
+                "mode": "cached",
+                "search_mode": str(row["search_mode"]),
+                "animal_focus": bool(row["animal_focus"]),
+                "expanded_queries": self._load_string_list(row["expanded_queries_json"]),
+                "summary": summary,
+                "evidence_cards": evidence_cards,
+                "created_at": str(row["created_at"]),
+            }
+
+    def save_entity_summary_snapshot(
+        self,
+        entity_name: str,
+        search_mode: str,
+        summary: BalancedSummary,
+        evidence_cards: list[EvidenceCard],
+        latest_query_id: int | None,
+        source_window_days: int = 30,
+    ) -> None:
+        with self._connect() as connection:
+            entity_id = self._upsert_entity(connection, entity_name)
+            normalized_window_days = max(1, source_window_days)
+            summary_payload = summary.model_dump(mode="json")
+            evidence_payload = [card.model_dump(mode="json") for card in evidence_cards]
+            snapshot_hash = self._build_snapshot_hash(
+                mode=search_mode,
+                summary_payload=summary_payload,
+                evidence_payload=evidence_payload,
+                source_window_days=normalized_window_days,
+            )
+            connection.execute(
+                """
+                INSERT INTO entity_summary_snapshots (
+                    entity_id,
+                    mode,
+                    snapshot_hash,
+                    summary_json,
+                    evidence_cards_json,
+                    source_window_days,
+                    source_count,
+                    latest_query_id,
+                    generated_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ON CONFLICT(entity_id, mode, snapshot_hash) DO UPDATE SET
+                    latest_query_id = excluded.latest_query_id,
+                    generated_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    entity_id,
+                    search_mode,
+                    snapshot_hash,
+                    json.dumps(summary_payload, ensure_ascii=False),
+                    json.dumps(evidence_payload, ensure_ascii=False),
+                    normalized_window_days,
+                    len(evidence_cards),
+                    latest_query_id,
+                ),
+            )
+            connection.commit()
+
+    def get_entity_summary_snapshot(
+        self,
+        entity_name: str,
+        search_mode: str,
+    ) -> EntitySummarySnapshotResponse | None:
+        with self._connect() as connection:
+            entity_row = self._find_entity_by_name_or_alias(connection, entity_name)
+            if not entity_row:
+                return None
+
+            row = connection.execute(
+                """
+                SELECT mode, summary_json, evidence_cards_json, source_window_days, source_count, generated_at
+                FROM entity_summary_snapshots
+                WHERE entity_id = ? AND mode = ?
+                ORDER BY datetime(generated_at) DESC, id DESC
+                LIMIT 1
+                """,
+                (int(entity_row["id"]), search_mode),
+            ).fetchone()
+            if not row:
+                return None
+
+            summary = BalancedSummary.model_validate(json.loads(str(row["summary_json"])))
+            cards = [
+                EvidenceCard.model_validate(item)
+                for item in json.loads(str(row["evidence_cards_json"]))
+                if isinstance(item, dict)
+            ]
+            return EntitySummarySnapshotResponse(
+                entity_name=str(entity_row["name"]),
+                mode=str(row["mode"]),
+                animal_focus=str(row["mode"]) == "animal_law",
+                source_count=int(row["source_count"] or 0),
+                source_window_days=int(row["source_window_days"] or 30),
+                generated_at=str(row["generated_at"]),
+                summary=summary,
+                evidence_cards=cards,
+            )
+
+    def refresh_entity_question_suggestions(
+        self,
+        entity_name: str,
+        search_mode: str,
+        latest_summary: BalancedSummary | None = None,
+    ) -> None:
+        with self._connect() as connection:
+            entity_row = self._find_entity_by_name_or_alias(connection, entity_name)
+            if not entity_row:
+                return
+
+            entity_id = int(entity_row["id"])
+            entity_type = str(entity_row["entity_type"] or "organization")
+            recent_rows = connection.execute(
+                """
+                SELECT question
+                FROM search_queries
+                WHERE entity_id = ? AND search_mode = ?
+                ORDER BY id DESC
+                LIMIT 4
+                """,
+                (entity_id, search_mode),
+            ).fetchall()
+
+            suggestions: list[tuple[str, str, int, str]] = []
+            seen_questions: set[str] = set()
+            for category, question_text in question_templates_for(entity_type, search_mode):
+                normalized = question_text.strip()
+                if normalized in seen_questions:
+                    continue
+                seen_questions.add(normalized)
+                suggestions.append((category, normalized, 82, "seed"))
+
+            for row in recent_rows:
+                normalized = str(row["question"] or "").strip()
+                if not normalized or normalized in seen_questions:
+                    continue
+                seen_questions.add(normalized)
+                suggestions.append(("近期查核問題", normalized, 75, "search_history"))
+
+            if latest_summary:
+                follow_up_question = (
+                    "目前有哪些與動物福利相關的部分仍待進一步查核？"
+                    if search_mode == "animal_law"
+                    else "目前哪些部分已有公開資料，哪些仍待進一步查核？"
+                )
+                if follow_up_question not in seen_questions:
+                    suggestions.append(("近期爭議與待查問題", follow_up_question, 72, "summary_follow_up"))
+
+            self._replace_question_suggestions(connection, entity_id, search_mode, suggestions[:8])
+            connection.commit()
+
+    def get_entity_question_suggestions(
+        self,
+        entity_name: str,
+        search_mode: str,
+        limit: int = 8,
+    ) -> EntityQuestionSuggestionsResponse | None:
+        with self._connect() as connection:
+            entity_row = self._find_entity_by_name_or_alias(connection, entity_name)
+            if not entity_row:
+                return None
+
+            rows = connection.execute(
+                """
+                SELECT category, question_text, confidence_score, generated_from
+                FROM entity_question_suggestions
+                WHERE entity_id = ? AND mode = ? AND is_active = 1
+                ORDER BY confidence_score DESC, id ASC
+                LIMIT ?
+                """,
+                (int(entity_row["id"]), search_mode, max(1, limit)),
+            ).fetchall()
+
+            if not rows:
+                self.refresh_entity_question_suggestions(str(entity_row["name"]), search_mode)
+                rows = connection.execute(
+                    """
+                    SELECT category, question_text, confidence_score, generated_from
+                    FROM entity_question_suggestions
+                    WHERE entity_id = ? AND mode = ? AND is_active = 1
+                    ORDER BY confidence_score DESC, id ASC
+                    LIMIT ?
+                    """,
+                    (int(entity_row["id"]), search_mode, max(1, limit)),
+                ).fetchall()
+
+            return EntityQuestionSuggestionsResponse(
+                entity_name=str(entity_row["name"]),
+                mode=search_mode,
+                animal_focus=search_mode == "animal_law",
+                items=[
+                    EntityQuestionSuggestionItem(
+                        category=str(row["category"]),
+                        question_text=str(row["question_text"]),
+                        confidence_score=int(row["confidence_score"] or 0),
+                        generated_from=str(row["generated_from"]),
+                    )
+                    for row in rows
+                ],
+            )
+
+    def list_due_watchlist_entities(
+        self,
+        limit: int = 10,
+        entity_names: list[str] | None = None,
+    ) -> list[WatchlistEntity]:
+        with self._connect() as connection:
+            allowed_names: set[str] | None = None
+            allowed_entity_types = {
+                entity_type.strip().lower()
+                for entity_type in str(self.settings.watchlist_allowed_entity_types or "").split(",")
+                if entity_type.strip()
+            }
+            if entity_names:
+                allowed_names = set()
+                for name in entity_names:
+                    row = self._find_entity_by_name_or_alias(connection, name)
+                    if row:
+                        allowed_names.add(str(row["name"]))
+
+            rows = connection.execute(
+                """
+                SELECT e.name, e.entity_type, e.alias_json, ew.priority, ew.refresh_interval_hours, ew.default_mode, ew.next_crawl_at
+                FROM entity_watchlists ew
+                JOIN entities e ON e.id = ew.entity_id
+                WHERE ew.is_active = 1
+                  AND (ew.next_crawl_at IS NULL OR ew.next_crawl_at <= CURRENT_TIMESTAMP)
+                ORDER BY ew.priority ASC, e.name ASC
+                """
+            ).fetchall()
+
+            items: list[WatchlistEntity] = []
+            for row in rows:
+                entity_name = str(row["name"])
+                if allowed_names is not None and entity_name not in allowed_names:
+                    continue
+                entity_type = str(row["entity_type"] or "organization").lower()
+                if allowed_names is None and allowed_entity_types and entity_type not in allowed_entity_types:
+                    continue
+                items.append(
+                    WatchlistEntity(
+                        entity_name=entity_name,
+                        entity_type=entity_type,
+                        aliases=self._load_aliases(row["alias_json"]),
+                        priority=int(row["priority"] or 3),
+                        refresh_interval_hours=int(row["refresh_interval_hours"] or 24),
+                        default_mode=str(row["default_mode"] or "general"),
+                        next_crawl_at=str(row["next_crawl_at"]) if row["next_crawl_at"] else None,
+                    )
+                )
+                if len(items) >= max(1, limit):
+                    break
+            return items
+
+    def mark_watchlist_refresh_success(self, entity_name: str) -> None:
+        with self._connect() as connection:
+            entity_row = self._find_entity_by_name_or_alias(connection, entity_name)
+            if not entity_row:
+                return
+            connection.execute(
+                """
+                UPDATE entity_watchlists
+                SET
+                    last_crawled_at = CURRENT_TIMESTAMP,
+                    last_success_at = CURRENT_TIMESTAMP,
+                    last_error_at = NULL,
+                    last_error_message = NULL,
+                    next_crawl_at = datetime(CURRENT_TIMESTAMP, '+' || refresh_interval_hours || ' hours'),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE entity_id = ?
+                """,
+                (int(entity_row["id"]),),
+            )
+            connection.commit()
+
+    def mark_watchlist_refresh_failure(self, entity_name: str, error_message: str) -> None:
+        with self._connect() as connection:
+            entity_row = self._find_entity_by_name_or_alias(connection, entity_name)
+            if not entity_row:
+                return
+            connection.execute(
+                """
+                UPDATE entity_watchlists
+                SET
+                    last_crawled_at = CURRENT_TIMESTAMP,
+                    last_error_at = CURRENT_TIMESTAMP,
+                    last_error_message = ?,
+                    next_crawl_at = datetime(CURRENT_TIMESTAMP, ?),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE entity_id = ?
+                """,
+                (
+                    error_message[:500],
+                    f"+{max(1, self.settings.watchlist_retry_delay_minutes)} minutes",
+                    int(entity_row["id"]),
+                ),
+            )
+            connection.commit()
+
     def register_entity_alias(self, canonical_name: str, alias: str) -> int:
         with self._connect() as connection:
             entity_row = self._find_entity_by_name_or_alias(connection, canonical_name)
@@ -408,6 +1152,248 @@ class PersistenceService:
         connection.row_factory = sqlite3.Row
         return connection
 
+    def _ensure_search_query_columns(self, connection: sqlite3.Connection) -> None:
+        rows = connection.execute("PRAGMA table_info(search_queries)").fetchall()
+        columns = {str(row["name"]) for row in rows}
+        if "search_mode" not in columns:
+            connection.execute(
+                "ALTER TABLE search_queries ADD COLUMN search_mode TEXT NOT NULL DEFAULT 'general'"
+            )
+        if "animal_focus" not in columns:
+            connection.execute(
+                "ALTER TABLE search_queries ADD COLUMN animal_focus INTEGER NOT NULL DEFAULT 0"
+            )
+
+    def _ensure_entity_summary_snapshot_history(self, connection: sqlite3.Connection) -> None:
+        rows = connection.execute("PRAGMA table_info(entity_summary_snapshots)").fetchall()
+        columns = {str(row["name"]) for row in rows}
+        if not rows or "snapshot_hash" in columns:
+            return
+
+        legacy_rows = connection.execute(
+            """
+            SELECT entity_id, mode, summary_json, evidence_cards_json, source_window_days, source_count, latest_query_id, generated_at, updated_at
+            FROM entity_summary_snapshots
+            ORDER BY id ASC
+            """
+        ).fetchall()
+
+        connection.execute("ALTER TABLE entity_summary_snapshots RENAME TO entity_summary_snapshots_legacy")
+        connection.execute(
+            """
+            CREATE TABLE entity_summary_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_id INTEGER NOT NULL,
+                mode TEXT NOT NULL,
+                snapshot_hash TEXT NOT NULL DEFAULT '',
+                summary_json TEXT NOT NULL,
+                evidence_cards_json TEXT NOT NULL,
+                source_window_days INTEGER NOT NULL DEFAULT 30,
+                source_count INTEGER NOT NULL DEFAULT 0,
+                latest_query_id INTEGER,
+                generated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(entity_id, mode, snapshot_hash),
+                FOREIGN KEY (entity_id) REFERENCES entities(id),
+                FOREIGN KEY (latest_query_id) REFERENCES search_queries(id)
+            )
+            """
+        )
+
+        for row in legacy_rows:
+            summary_json = str(row["summary_json"] or "{}")
+            evidence_json = str(row["evidence_cards_json"] or "[]")
+            normalized_window_days = max(1, int(row["source_window_days"] or 30))
+            snapshot_hash = self._build_snapshot_hash(
+                mode=str(row["mode"] or "general"),
+                summary_payload=self._load_json_value(summary_json, default={}),
+                evidence_payload=self._load_json_value(evidence_json, default=[]),
+                source_window_days=normalized_window_days,
+            )
+            connection.execute(
+                """
+                INSERT INTO entity_summary_snapshots (
+                    entity_id,
+                    mode,
+                    snapshot_hash,
+                    summary_json,
+                    evidence_cards_json,
+                    source_window_days,
+                    source_count,
+                    latest_query_id,
+                    generated_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(entity_id, mode, snapshot_hash) DO UPDATE SET
+                    latest_query_id = excluded.latest_query_id,
+                    generated_at = excluded.generated_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    int(row["entity_id"]),
+                    str(row["mode"] or "general"),
+                    snapshot_hash,
+                    summary_json,
+                    evidence_json,
+                    normalized_window_days,
+                    int(row["source_count"] or 0),
+                    row["latest_query_id"],
+                    str(row["generated_at"] or "CURRENT_TIMESTAMP"),
+                    str(row["updated_at"] or row["generated_at"] or "CURRENT_TIMESTAMP"),
+                ),
+            )
+
+        connection.execute("DROP TABLE entity_summary_snapshots_legacy")
+
+    def _build_snapshot_hash(
+        self,
+        *,
+        mode: str,
+        summary_payload: object,
+        evidence_payload: object,
+        source_window_days: int,
+    ) -> str:
+        serialized = json.dumps(
+            {
+                "mode": mode,
+                "summary": summary_payload,
+                "evidence_cards": evidence_payload,
+                "source_window_days": max(1, source_window_days),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+    def _load_json_value(self, raw_value: str, *, default: object) -> object:
+        try:
+            return json.loads(raw_value)
+        except (TypeError, ValueError):
+            return default
+
+    def _bootstrap_builtin_watchlist(self, connection: sqlite3.Connection) -> None:
+        for item in WATCHLIST_SEED:
+            entity_id = self._upsert_entity(connection, str(item["canonical_name"]))
+            aliases = [str(alias) for alias in item.get("aliases", []) if str(alias).strip()]
+            merged_aliases = sorted(
+                {
+                    *self._load_aliases(
+                        connection.execute(
+                            "SELECT alias_json FROM entities WHERE id = ?",
+                            (entity_id,),
+                        ).fetchone()["alias_json"]
+                    ),
+                    *aliases,
+                }
+            )
+            connection.execute(
+                """
+                UPDATE entities
+                SET entity_type = ?, alias_json = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (
+                    str(item.get("entity_type") or "organization"),
+                    json.dumps(merged_aliases, ensure_ascii=False),
+                    entity_id,
+                ),
+            )
+            keywords = [str(item["canonical_name"]), *aliases]
+            for index, keyword in enumerate(keywords):
+                if not keyword.strip():
+                    continue
+                connection.execute(
+                    """
+                    INSERT INTO entity_keywords (entity_id, keyword, keyword_type, weight, is_active, updated_at)
+                    VALUES (?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
+                    ON CONFLICT(entity_id, keyword) DO UPDATE SET
+                        keyword_type = excluded.keyword_type,
+                        weight = excluded.weight,
+                        is_active = 1,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (
+                        entity_id,
+                        keyword.strip(),
+                        "canonical" if index == 0 else "alias",
+                        100 if index == 0 else 80,
+                    ),
+                )
+            connection.execute(
+                """
+                INSERT INTO entity_watchlists (
+                    entity_id,
+                    is_active,
+                    priority,
+                    refresh_interval_hours,
+                    default_mode,
+                    updated_at
+                ) VALUES (?, 1, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(entity_id) DO UPDATE SET
+                    is_active = 1,
+                    priority = excluded.priority,
+                    refresh_interval_hours = excluded.refresh_interval_hours,
+                    default_mode = excluded.default_mode,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    entity_id,
+                    int(item.get("priority") or 3),
+                    int(item.get("refresh_interval_hours") or 24),
+                    str(item.get("default_mode") or "general"),
+                ),
+            )
+            for mode in ("general", "animal_law"):
+                self._replace_question_suggestions(
+                    connection,
+                    entity_id,
+                    mode,
+                    [
+                        (category, question_text, 82, "seed")
+                        for category, question_text in question_templates_for(
+                            str(item.get("entity_type") or "organization"),
+                            mode,
+                        )[:8]
+                    ],
+                )
+        self._bootstrap_entity_page_profiles(connection)
+        connection.commit()
+
+    def _bootstrap_entity_page_profiles(self, connection: sqlite3.Connection) -> None:
+        for item in ENTITY_PAGE_SEED:
+            entity_id = self._upsert_entity(connection, str(item["canonical_name"]))
+            connection.execute(
+                """
+                INSERT INTO entity_page_profiles (
+                    entity_id,
+                    headline,
+                    introduction,
+                    location,
+                    cover_image_url,
+                    cover_image_alt,
+                    gallery_json,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(entity_id) DO UPDATE SET
+                    headline = excluded.headline,
+                    introduction = excluded.introduction,
+                    location = excluded.location,
+                    cover_image_url = excluded.cover_image_url,
+                    cover_image_alt = excluded.cover_image_alt,
+                    gallery_json = excluded.gallery_json,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    entity_id,
+                    str(item.get("headline") or ""),
+                    str(item.get("introduction") or ""),
+                    str(item.get("location") or ""),
+                    str(item.get("cover_image_url") or ""),
+                    str(item.get("cover_image_alt") or ""),
+                    json.dumps(item.get("gallery") or [], ensure_ascii=False),
+                ),
+            )
+
     def _upsert_entity(self, connection: sqlite3.Connection, entity_name: str) -> int:
         existing = self._find_entity_by_name_or_alias(connection, entity_name)
         if existing:
@@ -437,14 +1423,27 @@ class PersistenceService:
         entity_name: str,
     ) -> sqlite3.Row | None:
         direct_match = connection.execute(
-            "SELECT id, name, alias_json FROM entities WHERE name = ?",
+            "SELECT id, name, entity_type, alias_json FROM entities WHERE name = ?",
             (entity_name,),
         ).fetchone()
         if direct_match:
             return direct_match
 
+        keyword_match = connection.execute(
+            """
+            SELECT e.id, e.name, e.entity_type, e.alias_json
+            FROM entity_keywords ek
+            JOIN entities e ON e.id = ek.entity_id
+            WHERE ek.keyword = ? AND ek.is_active = 1
+            LIMIT 1
+            """,
+            (entity_name,),
+        ).fetchone()
+        if keyword_match:
+            return keyword_match
+
         rows = connection.execute(
-            "SELECT id, name, alias_json FROM entities",
+            "SELECT id, name, entity_type, alias_json FROM entities",
         ).fetchall()
         for row in rows:
             aliases = self._load_aliases(row["alias_json"])
@@ -461,6 +1460,45 @@ class PersistenceService:
             return []
         return [item for item in parsed if isinstance(item, str)]
 
+    def _build_cached_source_terms(
+        self,
+        entity_name: str,
+        question: str,
+        expanded_queries: list[str],
+    ) -> list[str]:
+        candidates = [
+            entity_name.strip(),
+            *self._build_exact_entity_terms(entity_name),
+            *self._extract_question_terms(question),
+        ]
+        for query in expanded_queries[:6]:
+            pieces = str(query).replace("site:", " ").replace('"', " ").split()
+            candidates.extend(piece.strip() for piece in pieces if len(piece.strip()) >= 2)
+
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            normalized = candidate.strip()
+            if len(normalized) < 2 or normalized in seen:
+                continue
+            seen.add(normalized)
+            ordered.append(normalized)
+        return ordered[:12]
+
+    def _build_exact_entity_terms(self, entity_name: str) -> list[str]:
+        base = entity_name.strip()
+        terms = [base]
+        for suffix in ("狗園", "樂園", "園區", "協會", "流浪狗園", "流浪毛小孩生命照護協會"):
+            if base.endswith(suffix):
+                root = base.removesuffix(suffix).strip()
+                if len(root) >= 2:
+                    terms.append(root)
+        return terms
+
+    def _extract_question_terms(self, question: str) -> list[str]:
+        markers = ("募資", "捐款", "善款", "財務", "透明", "爭議", "質疑", "道歉", "聲明", "報導", "新聞")
+        return [marker for marker in markers if marker in question]
+
     def _insert_query(
         self,
         connection: sqlite3.Connection,
@@ -468,6 +1506,8 @@ class PersistenceService:
         question: str,
         expanded_queries: list[str],
         mode: str,
+        search_mode: str,
+        animal_focus: bool,
     ) -> int:
         cursor = connection.execute(
             """
@@ -476,8 +1516,10 @@ class PersistenceService:
                 question,
                 normalized_question,
                 expanded_queries_json,
-                mode
-            ) VALUES (?, ?, ?, ?, ?)
+                mode,
+                search_mode,
+                animal_focus
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 entity_id,
@@ -485,9 +1527,110 @@ class PersistenceService:
                 question.strip().lower(),
                 json.dumps(expanded_queries, ensure_ascii=False),
                 mode,
+                search_mode,
+                1 if animal_focus else 0,
             ),
         )
         return int(cursor.lastrowid)
+
+    def _replace_question_suggestions(
+        self,
+        connection: sqlite3.Connection,
+        entity_id: int,
+        search_mode: str,
+        suggestions: list[tuple[str, str, int, str]],
+    ) -> None:
+        connection.execute(
+            "DELETE FROM entity_question_suggestions WHERE entity_id = ? AND mode = ?",
+            (entity_id, search_mode),
+        )
+        for category, question_text, confidence_score, generated_from in suggestions:
+            connection.execute(
+                """
+                INSERT INTO entity_question_suggestions (
+                    entity_id,
+                    mode,
+                    category,
+                    question_text,
+                    confidence_score,
+                    generated_from,
+                    is_active,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
+                """,
+                (
+                    entity_id,
+                    search_mode,
+                    category,
+                    question_text,
+                    confidence_score,
+                    generated_from,
+                ),
+            )
+
+    def _load_string_list(self, raw_value: str | None) -> list[str]:
+        if not raw_value:
+            return []
+        try:
+            parsed = json.loads(raw_value)
+        except json.JSONDecodeError:
+            return []
+        return [str(item) for item in parsed if isinstance(item, str)]
+
+    def _load_evidence_cards_for_query(
+        self,
+        connection: sqlite3.Connection,
+        query_id: int,
+    ) -> list[EvidenceCard]:
+        rows = connection.execute(
+            """
+            SELECT
+                ec.title,
+                ec.snippet,
+                ec.stance,
+                ec.claim_type,
+                ec.evidence_strength,
+                ec.first_hand_score,
+                ec.relevance_score,
+                ec.credibility_score,
+                ec.recency_label,
+                ec.duplicate_risk,
+                ec.notes,
+                s.url,
+                s.site_name,
+                s.source_type,
+                s.fetched_at,
+                s.published_at
+            FROM evidence_cards ec
+            JOIN sources s ON s.id = ec.source_id
+            WHERE ec.query_id = ?
+            ORDER BY ec.relevance_score DESC, ec.id ASC
+            """,
+            (query_id,),
+        ).fetchall()
+        return [
+            EvidenceCard(
+                title=str(row["title"]),
+                url=str(row["url"]),
+                source=str(row["site_name"]),
+                source_type=str(row["source_type"] or "other"),
+                snippet=str(row["snippet"]),
+                excerpt=None,
+                ai_summary=None,
+                extracted_at=str(row["fetched_at"]) if row["fetched_at"] else None,
+                published_at=str(row["published_at"]) if row["published_at"] else None,
+                stance=str(row["stance"]),
+                claim_type=str(row["claim_type"]),
+                evidence_strength=str(row["evidence_strength"]),
+                first_hand_score=int(row["first_hand_score"] or 0),
+                relevance_score=int(row["relevance_score"] or 0),
+                credibility_score=int(row["credibility_score"] or 0),
+                recency_label=str(row["recency_label"]),
+                duplicate_risk=str(row["duplicate_risk"]),
+                notes=str(row["notes"]),
+            )
+            for row in rows
+        ]
 
     def _insert_summary(
         self,
@@ -600,6 +1743,7 @@ class PersistenceService:
         duration_seconds: float | None = None,
     ) -> int:
         with self._connect() as connection:
+            canonical_entity_name = self._resolve_entity_name(connection, entity_name)
             cursor = connection.execute(
                 """
                 INSERT INTO media_files (
@@ -609,7 +1753,7 @@ class PersistenceService:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    entity_name, file_name, original_name, media_type,
+                    canonical_entity_name, file_name, original_name, media_type,
                     mime_type, file_size, width, height, duration_seconds,
                     caption, uploader_ip,
                 ),
@@ -638,8 +1782,9 @@ class PersistenceService:
             params: list[str | int] = []
 
             if entity_name:
+                normalized_entity_name = self._canonicalize_entity_name(connection, entity_name)
                 conditions.append("entity_name = ?")
-                params.append(entity_name)
+                params.append(normalized_entity_name)
             if media_type:
                 conditions.append("media_type = ?")
                 params.append(media_type)
@@ -661,8 +1806,9 @@ class PersistenceService:
 
     def get_media_stats(self, entity_name: str | None = None) -> MediaStatsResponse:
         with self._connect() as connection:
-            where = "WHERE entity_name = ?" if entity_name else ""
-            params: list[str] = [entity_name] if entity_name else []
+            normalized_entity_name = self._canonicalize_entity_name(connection, entity_name) if entity_name else None
+            where = "WHERE entity_name = ?" if normalized_entity_name else ""
+            params: list[str] = [normalized_entity_name] if normalized_entity_name else []
 
             row = connection.execute(
                 f"""
@@ -690,6 +1836,102 @@ class PersistenceService:
             )
             connection.commit()
             return cursor.rowcount > 0
+
+    def _build_entity_page_content(
+        self,
+        entity_name: str,
+        entity_type: str,
+        page_row: sqlite3.Row | None,
+    ) -> tuple[str, str, str, str, str, list[EntityPageImageItem]]:
+        fallback = self._default_entity_page_content(entity_name, entity_type)
+        if not page_row:
+            return (
+                str(fallback["headline"]),
+                str(fallback["introduction"]),
+                str(fallback["location"]),
+                str(fallback["cover_image_url"]),
+                str(fallback["cover_image_alt"]),
+                fallback["gallery"],
+            )
+
+        gallery = self._load_page_gallery(page_row["gallery_json"])
+        cover_image_url = str(page_row["cover_image_url"] or "").strip()
+        cover_image_alt = str(page_row["cover_image_alt"] or "").strip()
+        if not cover_image_url and gallery:
+            cover_image_url = gallery[0].url
+            cover_image_alt = gallery[0].alt_text
+        if not gallery and cover_image_url:
+            gallery = [EntityPageImageItem(url=cover_image_url, alt_text=cover_image_alt)]
+
+        return (
+            str(page_row["headline"] or fallback["headline"]),
+            str(page_row["introduction"] or fallback["introduction"]),
+            str(page_row["location"] or fallback["location"]),
+            cover_image_url,
+            cover_image_alt,
+            gallery,
+        )
+
+    def _default_entity_page_content(self, entity_name: str, entity_type: str) -> dict[str, object]:
+        type_label = {
+            "zoo": "動物園",
+            "shelter": "動物之家／收容所",
+            "rescue_org": "動保組織",
+        }.get(entity_type, "實體")
+        headline = f"{entity_name} 的專屬 {type_label} 資料頁"
+        introduction = (
+            f"{entity_name} 的專屬頁會持續累積基本介紹、資料庫摘要、附件與使用者評論，"
+            "方便後續長期追蹤這個實體的公開資訊與動物福利議題。"
+        )
+        return {
+            "headline": headline,
+            "introduction": introduction,
+            "location": "",
+            "cover_image_url": "",
+            "cover_image_alt": "",
+            "gallery": [],
+        }
+
+    def _load_page_gallery(self, raw_gallery: str | None) -> list[EntityPageImageItem]:
+        if not raw_gallery:
+            return []
+        try:
+            parsed = json.loads(raw_gallery)
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(parsed, list):
+            return []
+
+        items: list[EntityPageImageItem] = []
+        for item in parsed:
+            if isinstance(item, str) and item.strip():
+                items.append(EntityPageImageItem(url=item.strip()))
+                continue
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("url") or "").strip()
+            if not url:
+                continue
+            items.append(
+                EntityPageImageItem(
+                    url=url,
+                    alt_text=str(item.get("alt_text") or item.get("alt") or "").strip(),
+                    caption=str(item.get("caption") or "").strip(),
+                    source_page_url=str(item.get("source_page_url") or "").strip(),
+                )
+            )
+        return items
+
+    def _resolve_entity_name(self, connection: sqlite3.Connection, entity_name: str) -> str:
+        entity_id = self._upsert_entity(connection, entity_name)
+        row = connection.execute("SELECT name FROM entities WHERE id = ?", (entity_id,)).fetchone()
+        return str(row["name"]) if row else entity_name
+
+    def _canonicalize_entity_name(self, connection: sqlite3.Connection, entity_name: str) -> str:
+        entity_row = self._find_entity_by_name_or_alias(connection, entity_name)
+        if entity_row:
+            return str(entity_row["name"])
+        return entity_name
 
     def _row_to_media_response(self, row: sqlite3.Row) -> MediaFileResponse:
         return MediaFileResponse(
