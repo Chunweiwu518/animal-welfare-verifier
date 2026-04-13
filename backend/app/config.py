@@ -41,7 +41,7 @@ class Settings(BaseSettings):
     duckduckgo_timeout_seconds: int = 12
     metadata_enrich_limit: int = 24
     metadata_enrich_concurrency: int = 6
-    cached_source_limit: int = 12
+    cached_source_limit: int = 50
     db_first_min_cached_results: int = 4
     db_first_min_snapshot_sources: int = 4
     query_cache_ttl_hours: int = 24

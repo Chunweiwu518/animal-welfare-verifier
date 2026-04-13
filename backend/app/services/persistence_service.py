@@ -248,6 +248,7 @@ class PersistenceService:
     ) -> int:
         with self._connect() as connection:
             entity_id = self._upsert_entity(connection, entity_name)
+            self._auto_enroll_watchlist(connection, entity_id, search_mode)
             query_id = self._insert_query(
                 connection,
                 entity_id,
@@ -1037,6 +1038,32 @@ class PersistenceService:
                 if len(items) >= max(1, limit):
                     break
             return items
+
+    def _auto_enroll_watchlist(
+        self,
+        connection: sqlite3.Connection,
+        entity_id: int,
+        search_mode: str,
+    ) -> None:
+        """Auto-add an entity to the watchlist when it is searched for the first time."""
+        existing = connection.execute(
+            "SELECT 1 FROM entity_watchlists WHERE entity_id = ?",
+            (entity_id,),
+        ).fetchone()
+        if existing:
+            return
+        default_mode = "animal_law" if search_mode == "animal_law" else "general"
+        connection.execute(
+            """
+            INSERT INTO entity_watchlists (
+                entity_id, is_active, priority, refresh_interval_hours,
+                default_mode, updated_at
+            ) VALUES (?, 1, 3, 168, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(entity_id) DO NOTHING
+            """,
+            (entity_id, default_mode),
+        )
+        logger.info("auto_enroll_watchlist entity_id=%d mode=%s", entity_id, default_mode)
 
     def mark_watchlist_refresh_success(self, entity_name: str) -> None:
         with self._connect() as connection:

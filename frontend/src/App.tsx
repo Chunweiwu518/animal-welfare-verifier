@@ -597,8 +597,8 @@ function buildStoredSession(state: SearchSessionState) {
 
 function App() {
   const [route, setRoute] = useState<AppRoute>(() => parseAppRoute(window.location.pathname))
-  const [entityName, setEntityName] = useState('某某動物園區')
-  const [question, setQuestion] = useState('是否有募資不透明或動物福利爭議？')
+  const [entityName, setEntityName] = useState('')
+  const [question, setQuestion] = useState('')
   const [animalFocus, setAnimalFocus] = useState(false)
   const [result, setResult] = useState<SearchResponse | null>(null)
   const [profile, setProfile] = useState<EntityProfileResponse | null>(null)
@@ -949,8 +949,16 @@ function App() {
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
+    if (!entityName.trim()) {
+      setError('請輸入搜尋內容')
+      return
+    }
     setLoading(true)
     setError(null)
+
+    const effectiveQuestion = question.trim() || (animalFocus
+      ? '是否可能涉及動保法、虐待、超收或飼養環境問題？'
+      : '近期整體公開評價與相關爭議？')
 
     try {
       const response = await fetch(`${API_BASE_URL}/api/search`, {
@@ -959,8 +967,8 @@ function App() {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          entity_name: entityName,
-          question,
+          entity_name: entityName.trim(),
+          question: effectiveQuestion,
           animal_focus: animalFocus,
         }),
       })
@@ -1175,10 +1183,10 @@ function App() {
           {/* ── Hero Search ── */}
           <section className="hero" id="search">
             <div className="hero-inner">
-              <p className="hero-badge">🛡️ 第三方公開資料搜尋平台</p>
+              <p className="hero-badge">第三方公開資料搜尋平台</p>
               <h1 className="hero-title">搜尋動保園區，快速看全網證據</h1>
               <p className="hero-subtitle">
-                盡可能整理官方、新聞、社群、論壇、Google 與募資相關公開資料，幫你快速掌握爭議與背景。
+                整理官方、新聞、社群、論壇、Google 與募資相關公開資料，幫你快速掌握評價與背景。
               </p>
 
               <form className="search-form" onSubmit={handleSubmit}>
@@ -1198,9 +1206,8 @@ function App() {
                   </p>
                 </div>
 
-                <div className="search-row">
-                  <div className="search-field">
-                    <label htmlFor="entity-input">查詢對象</label>
+                <div className="search-row search-row-single">
+                  <div className="search-field search-field-grow">
                     <input
                       id="entity-input"
                       value={entityName}
@@ -1210,34 +1217,14 @@ function App() {
                         void loadEntityOptions(nextValue)
                       }}
                       onFocus={() => void loadEntityOptions(entityName)}
-                      placeholder="輸入園區名稱，例如：TSSDA、某某狗園"
-                    />
-                  </div>
-                  <div className="search-field search-field-grow">
-                    <label htmlFor="question-input">想查的問題</label>
-                    <input
-                      id="question-input"
-                      value={question}
-                      onChange={(event) => setQuestion(event.target.value)}
-                      placeholder={questionPlaceholder}
+                      placeholder={animalFocus
+                        ? '搜尋動保園區或協會，例如：董旺旺狗園、壽山動物園'
+                        : '搜尋動保園區或協會，例如：董旺旺狗園、壽山動物園'}
                     />
                   </div>
                   <button type="submit" className="search-btn" disabled={loading}>
-                    {loading ? '搜尋中…' : '開始搜尋'}
+                    {loading ? '搜尋中…' : '搜尋'}
                   </button>
-                </div>
-
-                <div className="quick-tags">
-                  {quickQuestions.map((item) => (
-                    <button
-                      key={item}
-                      type="button"
-                      className={`quick-tag${question === item ? ' active' : ''}`}
-                      onClick={() => handleQuestionSelect(item)}
-                    >
-                      {item}
-                    </button>
-                  ))}
                 </div>
 
                 {error ? <p className="error-msg">{error}</p> : null}

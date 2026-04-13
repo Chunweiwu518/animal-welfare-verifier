@@ -216,6 +216,18 @@
   transition: border-color 0.15s, box-shadow 0.15s;
 }
 
+.search-row-single .search-field input {
+  height: 52px;
+  font-size: 1.05rem;
+  border-radius: 26px;
+  padding: 0 24px;
+}
+
+.search-row-single .search-btn {
+  border-radius: 26px;
+  height: 52px;
+}
+
 .search-field input:focus {
   outline: none;
   border-color: #0d7c5f;

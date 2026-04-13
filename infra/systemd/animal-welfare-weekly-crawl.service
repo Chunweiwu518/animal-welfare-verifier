@@ -1,0 +1,10 @@
+[Unit]
+Description=Animal Welfare Verifier — Weekly Browser Crawl
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/wuchunwei/animal-welfare-verifier
+ExecStart=/home/wuchunwei/animal-welfare-verifier/scripts/weekly-browser-crawl.sh
+TimeoutStartSec=1800
