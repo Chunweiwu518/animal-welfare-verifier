@@ -625,6 +625,31 @@ function App() {
   const [hiddenBrokenImages, setHiddenBrokenImages] = useState<Record<string, boolean>>({})
   const fileInputRef = useRef<HTMLInputElement | null>(null)
 
+  // Crawled reviews state
+  type CrawledReview = {
+    id: number
+    platform: string
+    author: string | null
+    content: string
+    sentiment: string | null
+    rating: number | null
+    source_url: string
+    parent_title: string | null
+    likes: number
+    published_at: string | null
+    fetched_at: string
+  }
+  const [crawledReviews, setCrawledReviews] = useState<CrawledReview[]>([])
+  const [reviewStats, setReviewStats] = useState<Record<string, number>>({})
+  const [reviewPlatformTab, setReviewPlatformTab] = useState<string>('all')
+  const [reviewsLoading, setReviewsLoading] = useState(false)
+
+  // Autocomplete state
+  type SuggestItem = { name: string; aliases: string[]; review_count: number }
+  const [suggestions, setSuggestions] = useState<SuggestItem[]>([])
+  const [showSuggestions, setShowSuggestions] = useState(false)
+  const suggestTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
   const evidenceFilters: EvidenceFilter[] = ['全部', '最新', '支持疑慮', '反駁疑慮', '官方', '新聞', '論壇', '社群']
   const isEntityRoute = route.name === 'entity'
   const quickQuestions = entityQuestions.length
@@ -902,11 +927,73 @@ function App() {
 
       const pageData: EntityPageResponse = await pageResponse.json()
       setEntityPageData(pageData)
+
+      // Load crawled reviews and stats in parallel
+      loadCrawledReviews(targetEntity)
+
       return pageData
     } catch {
       setEntityPageData(null)
       return null
     }
+  }
+
+  async function loadCrawledReviews(targetEntity: string, platform?: string) {
+    setReviewsLoading(true)
+    try {
+      const enc = encodeURIComponent(targetEntity)
+      const platformParam = platform && platform !== 'all' ? `&platform=${platform}` : ''
+      const [reviewsRes, statsRes] = await Promise.all([
+        fetch(`${API_BASE_URL}/api/entities/${enc}/reviews?limit=50${platformParam}`),
+        fetch(`${API_BASE_URL}/api/entities/${enc}/reviews/stats`),
+      ])
+      if (reviewsRes.ok) {
+        setCrawledReviews(await reviewsRes.json())
+      }
+      if (statsRes.ok) {
+        setReviewStats(await statsRes.json())
+      }
+    } catch {
+      // silent
+    } finally {
+      setReviewsLoading(false)
+    }
+  }
+
+  function handleReviewPlatformTab(platform: string) {
+    setReviewPlatformTab(platform)
+    if (route.name === 'entity') {
+      loadCrawledReviews(route.entityName, platform)
+    }
+  }
+
+  function handleSuggestInput(value: string) {
+    setEntityName(value)
+    if (suggestTimeoutRef.current) clearTimeout(suggestTimeoutRef.current)
+    if (value.trim().length < 1) {
+      setSuggestions([])
+      setShowSuggestions(false)
+      return
+    }
+    suggestTimeoutRef.current = setTimeout(async () => {
+      try {
+        const res = await fetch(`${API_BASE_URL}/api/entities/suggest?q=${encodeURIComponent(value)}&limit=8`)
+        if (res.ok) {
+          const data: SuggestItem[] = await res.json()
+          setSuggestions(data)
+          setShowSuggestions(data.length > 0)
+        }
+      } catch {
+        // silent
+      }
+    }, 300)
+  }
+
+  function handleSuggestPick(item: SuggestItem) {
+    setEntityName(item.name)
+    setSuggestions([])
+    setShowSuggestions(false)
+    navigateToRoute({ name: 'entity', entityName: item.name })
   }
 
   function handleQuestionSelect(nextQuestion: string) {
@@ -1207,20 +1294,39 @@ function App() {
                 </div>
 
                 <div className="search-row search-row-single">
-                  <div className="search-field search-field-grow">
+                  <div className="search-field search-field-grow" style={{ position: 'relative' }}>
                     <input
                       id="entity-input"
                       value={entityName}
                       onChange={(event) => {
                         const nextValue = event.target.value
-                        setEntityName(nextValue)
+                        handleSuggestInput(nextValue)
                         void loadEntityOptions(nextValue)
                       }}
-                      onFocus={() => void loadEntityOptions(entityName)}
-                      placeholder={animalFocus
-                        ? '搜尋動保園區或協會，例如：董旺旺狗園、壽山動物園'
-                        : '搜尋動保園區或協會，例如：董旺旺狗園、壽山動物園'}
+                      onFocus={() => {
+                        void loadEntityOptions(entityName)
+                        if (entityName.trim()) handleSuggestInput(entityName)
+                      }}
+                      onBlur={() => setTimeout(() => setShowSuggestions(false), 200)}
+                      placeholder="搜尋動保園區或協會，例如：董旺旺狗園、壽山動物園"
+                      autoComplete="off"
                     />
+                    {showSuggestions && suggestions.length > 0 ? (
+                      <div className="suggest-dropdown">
+                        {suggestions.map((item) => (
+                          <button
+                            key={item.name}
+                            type="button"
+                            className="suggest-item"
+                            onMouseDown={() => handleSuggestPick(item)}
+                          >
+                            <span className="suggest-name">{item.name}</span>
+                            {item.aliases.length > 0 ? <span className="suggest-alias">({item.aliases.join(', ')})</span> : null}
+                            {item.review_count > 0 ? <span className="suggest-count">{item.review_count} 則評論</span> : null}
+                          </button>
+                        ))}
+                      </div>
+                    ) : null}
                   </div>
                   <button type="submit" className="search-btn" disabled={loading}>
                     {loading ? '搜尋中…' : '搜尋'}
@@ -1908,9 +2014,71 @@ function App() {
               </div>
             ) : null}
 
+            {/* Crawled platform reviews */}
+            <div className="reviews-section crawled-reviews-section">
+              <div className="reviews-header">
+                <h3>各平台評論（{Object.values(reviewStats).reduce((a, b) => a + b, 0)}）</h3>
+              </div>
+              <div className="review-platform-tabs">
+                {[
+                  { key: 'all', label: '全部', count: Object.values(reviewStats).reduce((a, b) => a + b, 0) },
+                  { key: 'ptt', label: 'PTT', count: reviewStats['ptt'] || 0 },
+                  { key: 'google_maps', label: 'Google Maps', count: reviewStats['google_maps'] || 0 },
+                  { key: 'news', label: '新聞', count: reviewStats['news'] || 0 },
+                  { key: 'threads', label: 'Threads', count: reviewStats['threads'] || 0 },
+                  { key: 'instagram_posts', label: 'IG 貼文', count: reviewStats['instagram_posts'] || 0 },
+                  { key: 'instagram_comments', label: 'IG 留言', count: reviewStats['instagram_comments'] || 0 },
+                  { key: 'facebook_posts', label: 'FB 貼文', count: reviewStats['facebook_posts'] || 0 },
+                  { key: 'facebook_comments', label: 'FB 留言', count: reviewStats['facebook_comments'] || 0 },
+                ].filter(t => t.key === 'all' || t.count > 0).map(tab => (
+                  <button
+                    key={tab.key}
+                    className={`review-platform-tab${reviewPlatformTab === tab.key ? ' active' : ''}`}
+                    onClick={() => handleReviewPlatformTab(tab.key)}
+                  >
+                    {tab.label} ({tab.count})
+                  </button>
+                ))}
+              </div>
+              {reviewsLoading ? (
+                <div className="reviews-loading">載入評論中...</div>
+              ) : crawledReviews.length > 0 ? (
+                <div className="crawled-review-list">
+                  {crawledReviews.map((review) => (
+                    <article key={review.id} className="crawled-review-card">
+                      <div className="crawled-review-meta">
+                        {review.sentiment ? (
+                          <span className={`review-sentiment sentiment-${review.sentiment === '推' ? 'positive' : review.sentiment === '噓' ? 'negative' : 'neutral'}`}>
+                            {review.sentiment}
+                          </span>
+                        ) : review.rating ? (
+                          <span className="review-rating">{'★'.repeat(review.rating)}{'☆'.repeat(5 - review.rating)}</span>
+                        ) : null}
+                        {review.author ? <span className="review-author">{review.author}</span> : null}
+                        <span className="review-platform-badge">{review.platform}</span>
+                        {review.published_at ? <span className="review-date">{review.published_at.slice(0, 10)}</span> : null}
+                      </div>
+                      <p className="crawled-review-content">{review.content}</p>
+                      {review.parent_title ? (
+                        <div className="crawled-review-source">
+                          {review.source_url ? (
+                            <a href={review.source_url} target="_blank" rel="noopener noreferrer">{review.parent_title}</a>
+                          ) : (
+                            <span>{review.parent_title}</span>
+                          )}
+                        </div>
+                      ) : null}
+                    </article>
+                  ))}
+                </div>
+              ) : (
+                <div className="empty-review-state">尚未爬取到此對象的評論。可以透過 pipeline 排程爬取。</div>
+              )}
+            </div>
+
             <div className="reviews-section comment-section">
               <div className="reviews-header">
-                <h3>💬 累積評論（{entityPageData?.total_comments ?? 0}）</h3>
+                <h3>使用者評論（{entityPageData?.total_comments ?? 0}）</h3>
                 <p className="reviews-hint">這裡會持續累積針對這個實體的觀察評論，可單獨送出，也可搭配下方附件一起補充。</p>
               </div>
               {entityPageData?.comments.length ? (

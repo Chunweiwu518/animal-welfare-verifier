@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     serpapi_api_key: str | None = None
     facebook_cookies_path: str | None = None
     facebook_page_ids: str | None = None  # comma-separated page IDs
+    apify_api_token: str | None = None
     media_upload_dir: str = "data/media"
     max_upload_size_mb: int = 200  # max single file size in MB
     search_result_limit: int = 100

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 
 from app.config import Settings
@@ -218,6 +219,40 @@ class PersistenceService:
                     FOREIGN KEY (entity_id) REFERENCES entities(id)
                 );
 
+                CREATE TABLE IF NOT EXISTS reviews (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    entity_id INTEGER NOT NULL,
+                    platform TEXT NOT NULL,
+                    author TEXT,
+                    content TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    sentiment TEXT,
+                    rating INTEGER,
+                    source_url TEXT NOT NULL,
+                    parent_title TEXT,
+                    likes INTEGER NOT NULL DEFAULT 0,
+                    published_at TEXT,
+                    fetched_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (entity_id) REFERENCES entities(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS pipeline_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    pipeline_name TEXT NOT NULL,
+                    entity_name TEXT,
+                    started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    finished_at TEXT,
+                    status TEXT NOT NULL DEFAULT 'running',
+                    reviews_written INTEGER NOT NULL DEFAULT 0,
+                    error_message TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_reviews_entity_platform ON reviews(entity_id, platform);
+                CREATE INDEX IF NOT EXISTS idx_reviews_entity_published ON reviews(entity_id, published_at DESC);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_reviews_dedup ON reviews(entity_id, platform, content_hash);
+                CREATE INDEX IF NOT EXISTS idx_pipeline_runs_name ON pipeline_runs(pipeline_name, started_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_media_entity ON media_files(entity_name);
                 CREATE INDEX IF NOT EXISTS idx_snapshots_entity_mode ON entity_summary_snapshots(entity_id, mode);
                 CREATE INDEX IF NOT EXISTS idx_question_suggestions_entity_mode ON entity_question_suggestions(entity_id, mode, is_active);
@@ -1173,6 +1208,157 @@ class PersistenceService:
                     break
 
             return EntityListResponse(items=items)
+
+    # ── Review CRUD ──────────────────────────────────────────
+
+    def save_reviews(
+        self,
+        entity_name: str,
+        platform: str,
+        reviews: list[dict],
+    ) -> int:
+        """Insert reviews, skip duplicates. Returns count of newly inserted rows."""
+        with self._connect() as connection:
+            entity_id = self._upsert_entity(connection, entity_name)
+            inserted = 0
+            for item in reviews:
+                content = str(item.get("content") or "").strip()
+                if not content:
+                    continue
+                author = item.get("author") or ""
+                content_hash = hashlib.md5(
+                    f"{entity_id}:{platform}:{author}:{content[:200]}".encode()
+                ).hexdigest()
+                existing = connection.execute(
+                    "SELECT 1 FROM reviews WHERE entity_id = ? AND platform = ? AND content_hash = ?",
+                    (entity_id, platform, content_hash),
+                ).fetchone()
+                if existing:
+                    continue
+                connection.execute(
+                    """
+                    INSERT INTO reviews (
+                        entity_id, platform, author, content, content_hash, sentiment,
+                        rating, source_url, parent_title, likes,
+                        published_at, fetched_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        entity_id,
+                        platform,
+                        author or None,
+                        content,
+                        content_hash,
+                        item.get("sentiment"),
+                        item.get("rating"),
+                        str(item.get("source_url") or ""),
+                        item.get("parent_title"),
+                        int(item.get("likes") or 0),
+                        item.get("published_at"),
+                        item.get("fetched_at") or datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
+                inserted += 1
+            connection.commit()
+            return inserted
+
+    def get_reviews(
+        self,
+        entity_name: str,
+        *,
+        platform: str | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> list[dict]:
+        with self._connect() as connection:
+            entity_row = self._find_entity_by_name_or_alias(connection, entity_name)
+            if not entity_row:
+                return []
+            entity_id = int(entity_row["id"])
+            params: list[object] = [entity_id]
+            where = "WHERE r.entity_id = ?"
+            if platform:
+                where += " AND r.platform = ?"
+                params.append(platform)
+            params.extend([max(1, limit), max(0, offset)])
+            rows = connection.execute(
+                f"""
+                SELECT r.id, r.platform, r.author, r.content, r.sentiment,
+                       r.rating, r.source_url, r.parent_title, r.likes,
+                       r.published_at, r.fetched_at
+                FROM reviews r
+                {where}
+                ORDER BY r.published_at DESC, r.id DESC
+                LIMIT ? OFFSET ?
+                """,
+                params,
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_review_stats(self, entity_name: str) -> dict[str, int]:
+        with self._connect() as connection:
+            entity_row = self._find_entity_by_name_or_alias(connection, entity_name)
+            if not entity_row:
+                return {}
+            rows = connection.execute(
+                "SELECT platform, COUNT(*) AS cnt FROM reviews WHERE entity_id = ? GROUP BY platform",
+                (int(entity_row["id"]),),
+            ).fetchall()
+            return {str(row["platform"]): int(row["cnt"]) for row in rows}
+
+    def suggest_entities(self, query: str, limit: int = 10) -> list[dict]:
+        """Lightweight autocomplete: prefix-match + substring on name/alias/keywords."""
+        normalized = query.strip().lower()
+        if not normalized:
+            return []
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT e.id, e.name, e.alias_json
+                FROM entities e
+                ORDER BY e.name ASC
+                """,
+            ).fetchall()
+            results: list[dict] = []
+            for row in rows:
+                name = str(row["name"])
+                aliases = self._load_aliases(row["alias_json"])
+                haystack = [name, *aliases]
+                matched = any(normalized in h.lower() for h in haystack)
+                if not matched:
+                    continue
+                prefix = any(h.lower().startswith(normalized) for h in haystack)
+                review_count = connection.execute(
+                    "SELECT COUNT(*) AS cnt FROM reviews WHERE entity_id = ?",
+                    (int(row["id"]),),
+                ).fetchone()["cnt"]
+                results.append({
+                    "name": name,
+                    "aliases": aliases,
+                    "review_count": int(review_count),
+                    "prefix_match": prefix,
+                })
+            results.sort(key=lambda x: (not x["prefix_match"], -x["review_count"], x["name"]))
+            return [{"name": r["name"], "aliases": r["aliases"], "review_count": r["review_count"]} for r in results[:limit]]
+
+    def log_pipeline_run(
+        self,
+        pipeline_name: str,
+        entity_name: str | None,
+        status: str,
+        reviews_written: int = 0,
+        error_message: str | None = None,
+    ) -> int:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO pipeline_runs (pipeline_name, entity_name, status, reviews_written, error_message, finished_at)
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                (pipeline_name, entity_name, status, reviews_written, error_message),
+            )
+            connection.commit()
+            return int(cursor.lastrowid)
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path)

@@ -116,6 +116,42 @@ async def register_entity_alias(
     return {"status": "ok"}
 
 
+@router.get("/entities/suggest")
+async def suggest_entities(
+    q: str = "",
+    limit: int = 10,
+    settings: Settings = Depends(get_request_settings),
+) -> list[dict]:
+    persistence_service = PersistenceService(settings)
+    return persistence_service.suggest_entities(q, limit=min(max(limit, 1), 50))
+
+
+@router.get("/entities/{entity_name}/reviews")
+async def get_entity_reviews(
+    entity_name: str,
+    platform: str | None = None,
+    limit: int = 20,
+    offset: int = 0,
+    settings: Settings = Depends(get_request_settings),
+) -> list[dict]:
+    persistence_service = PersistenceService(settings)
+    return persistence_service.get_reviews(
+        entity_name,
+        platform=platform,
+        limit=min(max(limit, 1), 100),
+        offset=max(offset, 0),
+    )
+
+
+@router.get("/entities/{entity_name}/reviews/stats")
+async def get_entity_review_stats(
+    entity_name: str,
+    settings: Settings = Depends(get_request_settings),
+) -> dict[str, int]:
+    persistence_service = PersistenceService(settings)
+    return persistence_service.get_review_stats(entity_name)
+
+
 @router.get("/entities", response_model=EntityListResponse)
 async def list_entities(
     q: str | None = None,
