@@ -7,7 +7,9 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.config import Settings, get_settings
+from app.routes.auth import router as auth_router
 from app.routes.media import router as media_router
+from app.routes.ratings import router as ratings_router
 from app.routes.search import router as search_router
 from app.services.persistence_service import PersistenceService
 
@@ -72,6 +74,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.include_router(search_router)
     app.include_router(media_router)
+    app.include_router(auth_router)
+    app.include_router(ratings_router)
     _configure_frontend_routes(app, resolved_settings)
     return app
 

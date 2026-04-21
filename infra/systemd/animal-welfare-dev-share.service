@@ -1,0 +1,14 @@
+[Unit]
+Description=Animal Welfare Verifier Dev Share
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/steven/animal-welfare-verifier
+ExecStart=/home/steven/animal-welfare-verifier/share-dev.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

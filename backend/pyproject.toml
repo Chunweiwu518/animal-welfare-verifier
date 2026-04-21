@@ -16,6 +16,7 @@ dependencies = [
   "facebook-scraper>=0.2.59",
   "trafilatura>=2.0.0",
   "uvicorn[standard]>=0.34.0",
+  "apify-client>=2.5.0",
 ]
 
 [project.optional-dependencies]

@@ -261,6 +261,10 @@ class PersistenceService:
             )
             self._ensure_entity_summary_snapshot_history(connection)
             self._ensure_search_query_columns(connection)
+            self._ensure_review_analysis_columns(connection)
+            self._ensure_user_tables(connection)
+            self._ensure_comment_user_column(connection)
+            self._ensure_review_comments_table(connection)
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_snapshots_entity_mode ON entity_summary_snapshots(entity_id, mode, generated_at DESC)"
             )
@@ -602,10 +606,13 @@ class PersistenceService:
             ).fetchone()
             comment_rows = connection.execute(
                 """
-                SELECT id, comment, created_at
-                FROM entity_comments
-                WHERE entity_id = ?
-                ORDER BY id DESC
+                SELECT c.id, c.comment, c.created_at,
+                       COALESCE(c.display_name, u.display_name, '') AS display_name,
+                       u.avatar_url AS avatar_url
+                FROM entity_comments c
+                LEFT JOIN users u ON u.id = c.user_id
+                WHERE c.entity_id = ?
+                ORDER BY c.id DESC
                 LIMIT ?
                 """,
                 (entity_id, max(1, comment_limit)),
@@ -648,13 +655,22 @@ class PersistenceService:
                         entity_name=canonical_name,
                         comment=str(row["comment"]),
                         created_at=str(row["created_at"]),
+                        display_name=str(row["display_name"] or "") if "display_name" in row.keys() else "",
+                        avatar_url=str(row["avatar_url"] or "") if "avatar_url" in row.keys() else "",
                     )
                     for row in comment_rows
                 ],
                 recent_media=[self._row_to_media_response(row) for row in media_rows],
             )
 
-    def save_entity_comment(self, entity_name: str, comment: str) -> EntityCommentResponse:
+    def save_entity_comment(
+        self,
+        entity_name: str,
+        comment: str,
+        *,
+        user_id: int | None = None,
+        display_name: str = "",
+    ) -> EntityCommentResponse:
         normalized_comment = comment.strip()
         if not normalized_comment:
             raise ValueError("comment cannot be empty")
@@ -666,11 +682,19 @@ class PersistenceService:
                 (entity_id,),
             ).fetchone()
             cursor = connection.execute(
-                "INSERT INTO entity_comments (entity_id, comment) VALUES (?, ?)",
-                (entity_id, normalized_comment),
+                """
+                INSERT INTO entity_comments (entity_id, comment, user_id, display_name)
+                VALUES (?, ?, ?, ?)
+                """,
+                (entity_id, normalized_comment, user_id, display_name),
             )
             comment_row = connection.execute(
-                "SELECT id, created_at FROM entity_comments WHERE id = ?",
+                """
+                SELECT c.id, c.created_at, u.avatar_url
+                FROM entity_comments c
+                LEFT JOIN users u ON u.id = c.user_id
+                WHERE c.id = ?
+                """,
                 (cursor.lastrowid,),
             ).fetchone()
             connection.commit()
@@ -680,6 +704,8 @@ class PersistenceService:
                 entity_name=str(entity_row["name"]),
                 comment=normalized_comment,
                 created_at=str(comment_row["created_at"]),
+                display_name=display_name,
+                avatar_url=str(comment_row["avatar_url"] or ""),
             )
 
     def upsert_entity_page_images(
@@ -1145,6 +1171,137 @@ class PersistenceService:
             )
             connection.commit()
 
+    def find_entity(self, entity_name: str) -> dict | None:
+        """Public entity lookup covering canonical name, alias_json, and keyword match."""
+        normalized = entity_name.strip()
+        if not normalized:
+            return None
+        with self._connect() as connection:
+            row = self._find_entity_by_name_or_alias(connection, normalized)
+            if row is None:
+                return None
+            return {
+                "id": int(row["id"]),
+                "name": str(row["name"]),
+                "entity_type": str(row["entity_type"] or ""),
+                "aliases": self._load_aliases(row["alias_json"]),
+            }
+
+    def create_shelter_full(
+        self,
+        *,
+        canonical_name: str,
+        entity_type: str,
+        aliases: list[str],
+        introduction: str,
+        location: str,
+        website: str,
+        facebook_url: str,
+        cover_image_url: str = "",
+    ) -> tuple[int, bool]:
+        """Create a new shelter with profile + watchlist in one transaction.
+
+        Returns (entity_id, created). `created=False` means entity already existed
+        (alias/name match); caller should treat as idempotent success.
+        """
+        normalized_name = canonical_name.strip()
+        if not normalized_name:
+            raise ValueError("canonical_name cannot be empty")
+
+        cleaned_aliases = [a.strip() for a in aliases if a and a.strip() and a.strip() != normalized_name]
+
+        with self._connect() as connection:
+            connection.execute("BEGIN")
+            try:
+                existing = self._find_entity_by_name_or_alias(connection, normalized_name)
+                if existing is None:
+                    for alias in cleaned_aliases:
+                        existing = self._find_entity_by_name_or_alias(connection, alias)
+                        if existing is not None:
+                            break
+
+                if existing is not None:
+                    connection.execute("COMMIT")
+                    return int(existing["id"]), False
+
+                cursor = connection.execute(
+                    "INSERT INTO entities (name, entity_type, alias_json) VALUES (?, ?, ?)",
+                    (
+                        normalized_name,
+                        entity_type or "organization",
+                        json.dumps(sorted(cleaned_aliases), ensure_ascii=False),
+                    ),
+                )
+                entity_id = int(cursor.lastrowid)
+
+                for alias in cleaned_aliases:
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO entity_keywords
+                            (entity_id, keyword, keyword_type, weight, is_active)
+                        VALUES (?, ?, 'alias', 70, 1)
+                        """,
+                        (entity_id, alias),
+                    )
+
+                headline = normalized_name
+                profile_parts: list[str] = []
+                if introduction:
+                    profile_parts.append(introduction)
+                if website:
+                    profile_parts.append(f"官網：{website}")
+                if facebook_url:
+                    profile_parts.append(f"Facebook：{facebook_url}")
+                stored_intro = "\n\n".join(profile_parts)
+
+                cover_url = (cover_image_url or "").strip()
+                cover_alt = f"{normalized_name} 介紹圖片" if cover_url else ""
+                connection.execute(
+                    """
+                    INSERT INTO entity_page_profiles (
+                        entity_id, headline, introduction, location,
+                        cover_image_url, cover_image_alt, gallery_json, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, '[]', CURRENT_TIMESTAMP)
+                    ON CONFLICT(entity_id) DO UPDATE SET
+                        headline = excluded.headline,
+                        introduction = excluded.introduction,
+                        location = excluded.location,
+                        cover_image_url = CASE
+                            WHEN excluded.cover_image_url != '' THEN excluded.cover_image_url
+                            ELSE entity_page_profiles.cover_image_url
+                        END,
+                        cover_image_alt = CASE
+                            WHEN excluded.cover_image_url != '' THEN excluded.cover_image_alt
+                            ELSE entity_page_profiles.cover_image_alt
+                        END,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (entity_id, headline, stored_intro, location, cover_url, cover_alt),
+                )
+
+                refresh_hours = max(1, int(self.settings.shelter_default_refresh_interval_hours))
+                # next_crawl_at=NULL → eligible for immediate crawl; the background
+                # first-crawl task will update this timestamp after it runs.
+                connection.execute(
+                    """
+                    INSERT INTO entity_watchlists (
+                        entity_id, is_active, priority, refresh_interval_hours,
+                        default_mode, next_crawl_at
+                    ) VALUES (?, 1, 5, ?, 'general', NULL)
+                    ON CONFLICT(entity_id) DO UPDATE SET
+                        is_active = 1,
+                        refresh_interval_hours = excluded.refresh_interval_hours,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (entity_id, refresh_hours),
+                )
+
+                connection.execute("COMMIT")
+                return entity_id, True
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+
     def register_entity_alias(self, canonical_name: str, alias: str) -> int:
         with self._connect() as connection:
             entity_row = self._find_entity_by_name_or_alias(connection, canonical_name)
@@ -1269,7 +1426,16 @@ class PersistenceService:
         platform: str | None = None,
         limit: int = 20,
         offset: int = 0,
+        min_relevance: float | None = 0.6,
+        include_unanalyzed: bool = True,
     ) -> list[dict]:
+        """Fetch reviews for an entity, optionally filtered by LLM relevance score.
+
+        min_relevance: only return reviews with relevance_score >= this value.
+          Set to None to disable filtering.
+        include_unanalyzed: if True, also include reviews where analyzed_at IS NULL
+          (analysis not yet run). Useful while analyzer is still catching up.
+        """
         with self._connect() as connection:
             entity_row = self._find_entity_by_name_or_alias(connection, entity_name)
             if not entity_row:
@@ -1280,20 +1446,38 @@ class PersistenceService:
             if platform:
                 where += " AND r.platform = ?"
                 params.append(platform)
+            if min_relevance is not None:
+                if include_unanalyzed:
+                    where += " AND (r.analyzed_at IS NULL OR r.relevance_score >= ?)"
+                else:
+                    where += " AND r.relevance_score >= ?"
+                params.append(float(min_relevance))
             params.extend([max(1, limit), max(0, offset)])
             rows = connection.execute(
                 f"""
                 SELECT r.id, r.platform, r.author, r.content, r.sentiment,
                        r.rating, r.source_url, r.parent_title, r.likes,
-                       r.published_at, r.fetched_at
+                       r.published_at, r.fetched_at,
+                       r.relevance_score, r.stance, r.short_summary,
+                       r.dimension_tags_json
                 FROM reviews r
                 {where}
-                ORDER BY r.published_at DESC, r.id DESC
+                ORDER BY
+                    CASE WHEN r.relevance_score IS NULL THEN 0.5 ELSE r.relevance_score END DESC,
+                    r.published_at DESC, r.id DESC
                 LIMIT ? OFFSET ?
                 """,
                 params,
             ).fetchall()
-            return [dict(row) for row in rows]
+            results = []
+            for row in rows:
+                d = dict(row)
+                try:
+                    d["dimension_tags"] = json.loads(d.pop("dimension_tags_json") or "[]")
+                except (json.JSONDecodeError, TypeError):
+                    d["dimension_tags"] = []
+                results.append(d)
+            return results
 
     def get_review_stats(self, entity_name: str) -> dict[str, int]:
         with self._connect() as connection:
@@ -1364,6 +1548,123 @@ class PersistenceService:
         connection = sqlite3.connect(self.db_path)
         connection.row_factory = sqlite3.Row
         return connection
+
+    def _ensure_comment_user_column(self, connection: sqlite3.Connection) -> None:
+        rows = connection.execute("PRAGMA table_info(entity_comments)").fetchall()
+        columns = {str(row["name"]) for row in rows}
+        if "user_id" not in columns:
+            connection.execute("ALTER TABLE entity_comments ADD COLUMN user_id INTEGER")
+        if "display_name" not in columns:
+            connection.execute("ALTER TABLE entity_comments ADD COLUMN display_name TEXT NOT NULL DEFAULT ''")
+
+    def _ensure_review_comments_table(self, connection: sqlite3.Connection) -> None:
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS review_comments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                review_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                display_name TEXT NOT NULL DEFAULT '',
+                comment TEXT NOT NULL,
+                attachments_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (review_id) REFERENCES reviews(id),
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_review_comments_review ON review_comments(review_id, id DESC);
+            """
+        )
+        # Add columns for existing DBs (idempotent)
+        cols = {str(r["name"]) for r in connection.execute("PRAGMA table_info(review_comments)")}
+        if "attachments_json" not in cols:
+            connection.execute(
+                "ALTER TABLE review_comments ADD COLUMN attachments_json TEXT NOT NULL DEFAULT '[]'"
+            )
+        if "is_anonymous" not in cols:
+            connection.execute(
+                "ALTER TABLE review_comments ADD COLUMN is_anonymous INTEGER NOT NULL DEFAULT 0"
+            )
+
+    def _ensure_user_tables(self, connection: sqlite3.Connection) -> None:
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider TEXT NOT NULL,
+                provider_user_id TEXT NOT NULL,
+                display_name TEXT NOT NULL DEFAULT '',
+                avatar_url TEXT NOT NULL DEFAULT '',
+                email TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_login_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(provider, provider_user_id)
+            );
+            CREATE TABLE IF NOT EXISTS user_sessions (
+                token TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            );
+            CREATE TABLE IF NOT EXISTS review_ratings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                review_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                score INTEGER NOT NULL CHECK (score BETWEEN 1 AND 5),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(review_id, user_id),
+                FOREIGN KEY (review_id) REFERENCES reviews(id),
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            );
+            CREATE TABLE IF NOT EXISTS review_reactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                review_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                reaction TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(review_id, user_id, reaction),
+                FOREIGN KEY (review_id) REFERENCES reviews(id),
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_user_sessions_user ON user_sessions(user_id);
+            CREATE INDEX IF NOT EXISTS idx_user_sessions_expires ON user_sessions(expires_at);
+            CREATE INDEX IF NOT EXISTS idx_review_ratings_review ON review_ratings(review_id);
+            CREATE INDEX IF NOT EXISTS idx_review_ratings_user ON review_ratings(user_id);
+            CREATE INDEX IF NOT EXISTS idx_review_reactions_review ON review_reactions(review_id, reaction);
+            """
+        )
+
+    def _ensure_review_analysis_columns(self, connection: sqlite3.Connection) -> None:
+        rows = connection.execute("PRAGMA table_info(reviews)").fetchall()
+        columns = {str(row["name"]) for row in rows}
+        if "relevance_score" not in columns:
+            connection.execute(
+                "ALTER TABLE reviews ADD COLUMN relevance_score REAL"
+            )
+        if "stance" not in columns:
+            connection.execute(
+                "ALTER TABLE reviews ADD COLUMN stance TEXT"
+            )
+        if "short_summary" not in columns:
+            connection.execute(
+                "ALTER TABLE reviews ADD COLUMN short_summary TEXT"
+            )
+        if "analyzed_at" not in columns:
+            connection.execute(
+                "ALTER TABLE reviews ADD COLUMN analyzed_at TEXT"
+            )
+        if "dimension_tags_json" not in columns:
+            connection.execute(
+                "ALTER TABLE reviews ADD COLUMN dimension_tags_json TEXT NOT NULL DEFAULT '[]'"
+            )
+        if "dimensions_classified_at" not in columns:
+            connection.execute(
+                "ALTER TABLE reviews ADD COLUMN dimensions_classified_at TEXT"
+            )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_reviews_analyzed ON reviews(entity_id, analyzed_at)"
+        )
 
     def _ensure_search_query_columns(self, connection: sqlite3.Connection) -> None:
         rows = connection.execute("PRAGMA table_info(search_queries)").fetchall()
@@ -2073,8 +2374,14 @@ class PersistenceService:
         if not cover_image_url and gallery:
             cover_image_url = gallery[0].url
             cover_image_alt = gallery[0].alt_text
-        if not gallery and cover_image_url:
-            gallery = [EntityPageImageItem(url=cover_image_url, alt_text=cover_image_alt)]
+        # If gallery's sole entry is the same as the cover, drop it — frontend
+        # already renders cover separately; showing it twice is noisy.
+        if (
+            cover_image_url
+            and len(gallery) == 1
+            and gallery[0].url.strip() == cover_image_url
+        ):
+            gallery = []
 
         return (
             str(page_row["headline"] or fallback["headline"]),

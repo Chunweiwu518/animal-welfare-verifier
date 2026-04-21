@@ -1,6 +1,6 @@
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 
 from app.config import Settings, get_request_settings
 from app.models.profile import (
@@ -14,10 +14,23 @@ from app.models.profile import (
     EntitySummarySnapshotResponse,
 )
 from app.models.search import ProviderDiagnostics, SearchDiagnostics, SearchRequest, SearchResponse
+from app.models.shelter import (
+    ShelterCreateRequest,
+    ShelterCreateResponse,
+    ShelterLookupEntity,
+    ShelterLookupResponse,
+    ShelterVerifyRequest,
+    ShelterVerifyResponse,
+)
+from app.auth import require_admin_token
+from app.routes.auth import require_user
+from app.services.auth_service import AuthUser
+from app.pipelines.orchestrator import CrawlOrchestrator
 from app.services.analysis_service import AnalysisService
 from app.services.official_image_service import OfficialImageService
 from app.services.persistence_service import PersistenceService
 from app.services.search_service import SearchService
+from app.services.shelter_verification_service import ShelterVerificationService
 
 router = APIRouter(prefix="/api", tags=["search"])
 logger = logging.getLogger("uvicorn.error").getChild(__name__)
@@ -61,6 +74,7 @@ async def get_entity_page(
 async def create_entity_comment(
     entity_name: str,
     request: EntityCommentCreateRequest,
+    user: AuthUser = Depends(require_user),
     settings: Settings = Depends(get_request_settings),
 ) -> EntityCommentResponse:
     normalized_comment = request.comment.strip()
@@ -68,7 +82,12 @@ async def create_entity_comment(
         raise HTTPException(status_code=400, detail="Comment cannot be empty")
 
     persistence_service = PersistenceService(settings)
-    return persistence_service.save_entity_comment(entity_name, normalized_comment)
+    return persistence_service.save_entity_comment(
+        entity_name,
+        normalized_comment,
+        user_id=user.id,
+        display_name=user.display_name,
+    )
 
 
 @router.get("/entities/{entity_name}/snapshot", response_model=EntitySummarySnapshotResponse)
@@ -103,7 +122,7 @@ async def get_entity_question_suggestions(
     return suggestions
 
 
-@router.post("/entities/alias")
+@router.post("/entities/alias", dependencies=[Depends(require_admin_token)])
 async def register_entity_alias(
     request: EntityAliasRequest,
     settings: Settings = Depends(get_request_settings),
@@ -114,6 +133,105 @@ async def register_entity_alias(
         alias=request.alias.strip(),
     )
     return {"status": "ok"}
+
+
+@router.get("/entities/lookup", response_model=ShelterLookupResponse)
+async def lookup_entity(
+    q: str = "",
+    settings: Settings = Depends(get_request_settings),
+) -> ShelterLookupResponse:
+    query = (q or "").strip()
+    if not query:
+        return ShelterLookupResponse(found=False, entity=None)
+    persistence_service = PersistenceService(settings)
+    match = persistence_service.find_entity(query)
+    if match is None:
+        return ShelterLookupResponse(found=False, entity=None)
+    return ShelterLookupResponse(
+        found=True,
+        entity=ShelterLookupEntity(
+            name=match["name"],
+            aliases=match["aliases"],
+            entity_type=match["entity_type"],
+        ),
+    )
+
+
+@router.post(
+    "/shelters/verify",
+    response_model=ShelterVerifyResponse,
+    dependencies=[Depends(require_admin_token)],
+)
+async def verify_shelter(
+    request: ShelterVerifyRequest,
+    settings: Settings = Depends(get_request_settings),
+) -> ShelterVerifyResponse:
+    persistence_service = PersistenceService(settings)
+    existing = persistence_service.find_entity(request.query)
+    if existing is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Entity already exists: {existing['name']}",
+        )
+
+    service = ShelterVerificationService(settings)
+    if not service.is_available():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Verification service unavailable: missing OPENAI_API_KEY or TAVILY_API_KEY",
+        )
+
+    verified, candidate, reason = await service.verify(request.query)
+    return ShelterVerifyResponse(verified=verified, candidate=candidate, reason=reason)
+
+
+@router.post(
+    "/shelters/create",
+    response_model=ShelterCreateResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_admin_token)],
+)
+async def create_shelter(
+    request: ShelterCreateRequest,
+    background_tasks: BackgroundTasks,
+    settings: Settings = Depends(get_request_settings),
+) -> ShelterCreateResponse:
+    persistence_service = PersistenceService(settings)
+    entity_id, created = persistence_service.create_shelter_full(
+        canonical_name=request.canonical_name,
+        entity_type=request.entity_type,
+        aliases=request.aliases,
+        introduction=request.introduction,
+        location=request.address,
+        website=request.website,
+        facebook_url=request.facebook_url,
+        cover_image_url=request.cover_image_url,
+    )
+
+    scheduled = False
+    if created:
+        orchestrator = CrawlOrchestrator(settings, persistence_service)
+
+        async def _first_crawl() -> None:
+            try:
+                await orchestrator.run_all_for_entity(
+                    request.canonical_name,
+                    aliases=request.aliases,
+                    max_results=30,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("first_crawl_failed entity=%s", request.canonical_name)
+
+        background_tasks.add_task(_first_crawl)
+        scheduled = True
+
+    return ShelterCreateResponse(
+        entity_name=request.canonical_name,
+        entity_id=entity_id,
+        created=created,
+        scheduled_first_crawl=scheduled,
+        status="created" if created else "existing",
+    )
 
 
 @router.get("/entities/suggest")
@@ -132,14 +250,22 @@ async def get_entity_reviews(
     platform: str | None = None,
     limit: int = 20,
     offset: int = 0,
+    min_relevance: float | None = 0.6,
+    include_all: bool = False,
     settings: Settings = Depends(get_request_settings),
 ) -> list[dict]:
+    """Get reviews filtered by LLM relevance score (default >=0.6).
+
+    - min_relevance: override the threshold (0 disables filter).
+    - include_all: if True, ignore relevance filter entirely (raw data).
+    """
     persistence_service = PersistenceService(settings)
     return persistence_service.get_reviews(
         entity_name,
         platform=platform,
         limit=min(max(limit, 1), 100),
         offset=max(offset, 0),
+        min_relevance=None if include_all else min_relevance,
     )
 
 
@@ -162,7 +288,11 @@ async def list_entities(
     return persistence_service.list_entities(query=q, limit=min(max(limit, 1), 100))
 
 
-@router.post("/search", response_model=SearchResponse)
+@router.post(
+    "/search",
+    response_model=SearchResponse,
+    dependencies=[Depends(require_admin_token)],
+)
 async def search_reputation(
     request: SearchRequest,
     settings: Settings = Depends(get_request_settings),

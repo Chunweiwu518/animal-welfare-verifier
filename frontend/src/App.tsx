@@ -1,5 +1,21 @@
 import { ChangeEvent, DragEvent, FormEvent, useEffect, useRef, useState } from 'react'
 import './App.css'
+import { CreateShelterDialog } from './components/CreateShelterDialog'
+import { VerificationReviewDialog } from './components/VerificationReviewDialog'
+import {
+  createShelter,
+  lookupShelter,
+  verifyShelter,
+  type ShelterCandidate,
+} from './api/shelters'
+import { getAdminToken } from './api/adminToken'
+import { AdminTokenDialog } from './components/AdminTokenDialog'
+import { LoginDialog } from './components/LoginDialog'
+import { UserBadge } from './components/UserBadge'
+import { ReviewRatingBar } from './components/ReviewRatingBar'
+import { ReviewCommentThread } from './components/ReviewCommentThread'
+import { DimensionOverview } from './components/DimensionOverview'
+import { fetchCurrentUser, type AuthUser } from './api/auth'
 
 type MediaFile = {
   id: number
@@ -638,6 +654,10 @@ function App() {
     likes: number
     published_at: string | null
     fetched_at: string
+    relevance_score: number | null
+    stance: 'supporting' | 'opposing' | 'neutral' | 'unclear' | null
+    short_summary: string | null
+    dimension_tags: Array<{ dim: string; stance: string; excerpt: string }>
   }
   const [crawledReviews, setCrawledReviews] = useState<CrawledReview[]>([])
   const [reviewStats, setReviewStats] = useState<Record<string, number>>({})
@@ -649,6 +669,35 @@ function App() {
   const [suggestions, setSuggestions] = useState<SuggestItem[]>([])
   const [showSuggestions, setShowSuggestions] = useState(false)
   const suggestTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  // Shelter creation dialog state
+  type DialogStage = 'idle' | 'confirm' | 'verifying' | 'review' | 'creating'
+  const [dialogStage, setDialogStage] = useState<DialogStage>('idle')
+  const [pendingQuery, setPendingQuery] = useState('')
+  const [verifyError, setVerifyError] = useState<string | null>(null)
+  const [candidate, setCandidate] = useState<ShelterCandidate | null>(null)
+  const [createError, setCreateError] = useState<string | null>(null)
+
+  // Admin token dialog state
+  const [adminTokenDialogOpen, setAdminTokenDialogOpen] = useState(false)
+  const [hasAdminToken, setHasAdminToken] = useState<boolean>(() => Boolean(getAdminToken()))
+
+  // Selected dimension (null = show all reviews; otherwise filter reviews list)
+  const [selectedDim, setSelectedDim] = useState<string | null>(null)
+
+  // Auth state (LINE login)
+  const [authUser, setAuthUser] = useState<AuthUser>({ authenticated: false })
+  const [loginDialogOpen, setLoginDialogOpen] = useState(false)
+  const [loginDialogMessage, setLoginDialogMessage] = useState<string | undefined>(undefined)
+
+  useEffect(() => {
+    void fetchCurrentUser().then(setAuthUser).catch(() => {})
+  }, [])
+
+  function openLoginDialog(message?: string) {
+    setLoginDialogMessage(message)
+    setLoginDialogOpen(true)
+  }
 
   const evidenceFilters: EvidenceFilter[] = ['全部', '最新', '支持疑慮', '反駁疑慮', '官方', '新聞', '論壇', '社群']
   const isEntityRoute = route.name === 'entity'
@@ -1036,48 +1085,117 @@ function App() {
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    if (!entityName.trim()) {
+    const trimmed = entityName.trim()
+    if (!trimmed) {
       setError('請輸入搜尋內容')
       return
     }
     setLoading(true)
     setError(null)
 
-    const effectiveQuestion = question.trim() || (animalFocus
-      ? '是否可能涉及動保法、虐待、超收或飼養環境問題？'
-      : '近期整體公開評價與相關爭議？')
-
     try {
-      const response = await fetch(`${API_BASE_URL}/api/search`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          entity_name: entityName.trim(),
-          question: effectiveQuestion,
-          animal_focus: animalFocus,
-        }),
-      })
-
-      if (!response.ok) {
-        throw new Error('搜尋失敗，請確認後端服務是否已啟動。')
+      const lookup = await lookupShelter(trimmed)
+      if (lookup.found && lookup.entity) {
+        navigateToRoute({ name: 'entity', entityName: lookup.entity.name })
+        return
       }
 
-      const data: SearchResponse = await response.json()
-      setResult(data)
-      await loadEntityDatabasePreview(entityName, animalFocus)
-      await loadEntityProfile(entityName)
-      setActiveFilter('全部')
-      setActivePlatform('全部來源')
+      const suggestRes = await fetch(
+        `${API_BASE_URL}/api/entities/suggest?q=${encodeURIComponent(trimmed)}&limit=3`,
+      )
+      if (suggestRes.ok) {
+        const hits: SuggestItem[] = await suggestRes.json()
+        const normalized = trimmed.toLowerCase()
+        const singleClearHit =
+          hits.length === 1 &&
+          (hits[0].name.toLowerCase().includes(normalized) ||
+            hits[0].aliases.some((a) => a.toLowerCase().includes(normalized)))
+        if (singleClearHit) {
+          navigateToRoute({ name: 'entity', entityName: hits[0].name })
+          return
+        }
+      }
 
-      requestAnimationFrame(() => {
-        resultSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
-      })
+      setPendingQuery(trimmed)
+      setVerifyError(null)
+      setCreateError(null)
+      setCandidate(null)
+      setDialogStage('confirm')
     } catch (err) {
-      setError(err instanceof Error ? err.message : '發生未知錯誤')
+      setError(err instanceof Error ? err.message : '查詢失敗')
     } finally {
       setLoading(false)
+    }
+  }
+
+  async function handleVerifyConfirm() {
+    if (!pendingQuery) return
+    setDialogStage('verifying')
+    setVerifyError(null)
+    try {
+      const result = await verifyShelter(pendingQuery)
+      if (!result.verified || !result.candidate) {
+        const reasonMap: Record<string, string> = {
+          no_evidence_urls: 'AI 找不到可靠引用來源，可能不存在或名稱需要更明確',
+          verification_timeout: '查證超時，請再試一次',
+          verification_unavailable: '伺服器未設定 OPENAI_API_KEY 或 TAVILY_API_KEY',
+          model_rejected: 'AI 無法確認這個狗園存在',
+        }
+        const reason = reasonMap[result.reason] ?? result.reason ?? '查證失敗'
+        setVerifyError(reason)
+        setDialogStage('confirm')
+        return
+      }
+      setCandidate(result.candidate)
+      setDialogStage('review')
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '查證失敗'
+      if (message === 'SHELTER_ALREADY_EXISTS') {
+        navigateToRoute({ name: 'entity', entityName: pendingQuery })
+        setDialogStage('idle')
+        return
+      }
+      if (message === 'ADMIN_TOKEN_REQUIRED') {
+        setVerifyError('建立新狗園需要管理員 Token，請先在右下角設定。')
+        setDialogStage('confirm')
+        setAdminTokenDialogOpen(true)
+        return
+      }
+      if (message === 'VERIFICATION_UNAVAILABLE') {
+        setVerifyError('伺服器未設定 OPENAI_API_KEY 或 TAVILY_API_KEY，請先在後端 .env 設定。')
+      } else {
+        setVerifyError(message)
+      }
+      setDialogStage('confirm')
+    }
+  }
+
+  function handleDialogCancel() {
+    setDialogStage('idle')
+    setPendingQuery('')
+    setCandidate(null)
+    setVerifyError(null)
+    setCreateError(null)
+  }
+
+  async function handleCreateConfirm(edited: ShelterCandidate) {
+    setDialogStage('creating')
+    setCreateError(null)
+    try {
+      const result = await createShelter(edited)
+      setDialogStage('idle')
+      setCandidate(null)
+      setPendingQuery('')
+      navigateToRoute({ name: 'entity', entityName: result.entity_name })
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '建立失敗'
+      if (message === 'ADMIN_TOKEN_REQUIRED') {
+        setCreateError('建立需要管理員 Token，請先在右下角設定。')
+        setAdminTokenDialogOpen(true)
+      } else {
+        setCreateError(message)
+      }
+      setDialogStage('review')
     }
   }
 
@@ -1169,6 +1287,8 @@ function App() {
           reject(new Error('Network error'))
         }
         xhr.open('POST', `${API_BASE_URL}/api/media/upload`)
+        const token = getAdminToken()
+        if (token) xhr.setRequestHeader('X-Admin-Token', token)
         xhr.send(formData)
       })
     } catch { /* error already set in queue */ }
@@ -1257,10 +1377,11 @@ function App() {
             <span className="logo-text">動保評價</span>
           </a>
           <div className="header-actions">
-            <span className="mode-badge">{getModeLabel(result?.mode ?? null)}</span>
-            <span className={`mode-badge mode-badge-secondary${(result?.animal_focus ?? animalFocus) ? ' active' : ''}`}>
-              {getSearchModeLabel(result, animalFocus)}
-            </span>
+            <UserBadge
+              user={authUser}
+              onLoggedOut={() => setAuthUser({ authenticated: false })}
+              onClickLogin={() => openLoginDialog()}
+            />
           </div>
         </div>
       </header>
@@ -1277,22 +1398,6 @@ function App() {
               </p>
 
               <form className="search-form" onSubmit={handleSubmit}>
-                <div className="focus-toggle-row">
-                  <button
-                    type="button"
-                    className={`focus-toggle${animalFocus ? ' active' : ''}`}
-                    aria-pressed={animalFocus}
-                    onClick={handleAnimalFocusToggle}
-                  >
-                    動保法模式
-                  </button>
-                  <p className="focus-mode-note">
-                    {animalFocus
-                      ? '只顯示與動物福利、照護、疑似違規或動保法相關的內容'
-                      : '一般模式會保留較廣泛的評價、聲明、新聞與社群資訊'}
-                  </p>
-                </div>
-
                 <div className="search-row search-row-single">
                   <div className="search-field search-field-grow" style={{ position: 'relative' }}>
                     <input
@@ -1334,22 +1439,6 @@ function App() {
                 </div>
 
                 {error ? <p className="error-msg">{error}</p> : null}
-
-                {loading ? (
-                  <div className="search-loading-panel" aria-live="polite">
-                    <div className="loading-pulse-row">
-                      {searchProgressSteps.map((step, index) => (
-                        <span
-                          key={step}
-                          className={`loading-dot${index === searchStepIndex ? ' active' : ''}${index < searchStepIndex ? ' done' : ''}`}
-                        />
-                      ))}
-                    </div>
-                    <p className="loading-title">搜尋中，正在整理可用證據</p>
-                    <p className="loading-detail">{searchProgressSteps[searchStepIndex]}</p>
-                  </div>
-                ) : null}
-
               </form>
 
               {entityOptions.length > 0 ? (
@@ -1759,16 +1848,6 @@ function App() {
                     <p className="entity-aliases">別名：{(entityPageData?.aliases ?? profile?.aliases ?? []).join('、')}</p>
                   ) : null}
                   {entityPageData?.headline ? <p className="entity-page-headline">{entityPageData.headline}</p> : null}
-                  <p className={`entity-mode-note${animalFocus ? ' active' : ''}`}>
-                    {animalFocus
-                      ? '目前正在看動保法模式的摘要與待查問題。'
-                      : '目前正在看一般模式的整理摘要，可切換成動保法模式查看更聚焦的內容。'}
-                  </p>
-                </div>
-                <div className="score-box">
-                  <div className="score-number">{toFivePointScore(entityPageScore)}</div>
-                  <div className="score-label">{entitySnapshot ? '資料庫摘要' : '尚待建立'}</div>
-                  <div className="score-count">{entitySnapshot ? `${entitySnapshot.source_count} 則整理證據` : '先建立第一筆摘要'}</div>
                 </div>
               </div>
 
@@ -1779,7 +1858,7 @@ function App() {
                       ? entityPageData.introduction
                       : entitySnapshot
                         ? entitySnapshot.summary.verdict
-                        : '目前這個實體還沒有資料庫摘要，你可以直接用上方搜尋建立第一筆整理結果。'}
+                        : '此狗園資料正在蒐集中，稍後將顯示從各平台整理的評論。'}
                   </p>
                   {entityPageData?.location ? <p className="entity-page-location">📍 {entityPageData.location}</p> : null}
                 </div>
@@ -1798,32 +1877,13 @@ function App() {
               </div>
 
               <div className="entity-tags">
-                <span className={`entity-tag ${animalFocus ? 'tag-animal-mode' : 'tag-general-mode'}`}>
-                  {animalFocus ? '動保法模式' : '一般模式'}
-                </span>
                 {entitySnapshot ? <span className="entity-tag">{entitySnapshot.source_count} 則已整理證據</span> : null}
-                {profile ? <span className="entity-tag">累積查詢 {profile.total_queries}</span> : null}
                 {entityPageData ? <span className="entity-tag">累積評論 {entityPageData.total_comments}</span> : null}
                 {entityPageSourceSummary.map((item) => (
                   <span key={item.type} className={`entity-tag tag-${item.type}`}>
                     {item.label} {item.count}
                   </span>
                 ))}
-              </div>
-
-              <div className="entity-page-actions">
-                <button
-                  type="button"
-                  className="search-btn"
-                  onClick={() => {
-                    navigateToRoute({ name: 'home' }, true)
-                    requestAnimationFrame(() => {
-                      document.getElementById('search')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
-                    })
-                  }}
-                >
-                  用這個實體開始搜尋
-                </button>
               </div>
             </div>
 
@@ -2014,11 +2074,33 @@ function App() {
               </div>
             ) : null}
 
+            <DimensionOverview
+              entityName={selectedEntityLabel}
+              selectedDim={selectedDim}
+              onSelectDim={setSelectedDim}
+            />
+
             {/* Crawled platform reviews */}
             <div className="reviews-section crawled-reviews-section">
               <div className="reviews-header">
                 <h3>各平台評論（{Object.values(reviewStats).reduce((a, b) => a + b, 0)}）</h3>
               </div>
+              {selectedDim ? (
+                <div className="dim-filter-banner">
+                  <span>🔍 正在篩選「{
+                    { staff_attitude: '工作人員態度', transparency: '資訊透明度',
+                      environment: '環境整潔', animal_care: '照護狀況',
+                      communication: '對外溝通', adoption_process: '送養流程' }[selectedDim] ?? selectedDim
+                  }」相關評論</span>
+                  <button
+                    type="button"
+                    className="dim-filter-banner-clear"
+                    onClick={() => setSelectedDim(null)}
+                  >
+                    清除篩選
+                  </button>
+                </div>
+              ) : null}
               <div className="review-platform-tabs">
                 {[
                   { key: 'all', label: '全部', count: Object.values(reviewStats).reduce((a, b) => a + b, 0) },
@@ -2042,181 +2124,84 @@ function App() {
               </div>
               {reviewsLoading ? (
                 <div className="reviews-loading">載入評論中...</div>
-              ) : crawledReviews.length > 0 ? (
+              ) : (() => {
+                const displayReviews = selectedDim
+                  ? crawledReviews.filter((r) =>
+                      r.dimension_tags?.some((t) => t.dim === selectedDim),
+                    )
+                  : crawledReviews
+                return displayReviews.length > 0 ? (
                 <div className="crawled-review-list">
-                  {crawledReviews.map((review) => (
-                    <article key={review.id} className="crawled-review-card">
-                      <div className="crawled-review-meta">
-                        {review.sentiment ? (
-                          <span className={`review-sentiment sentiment-${review.sentiment === '推' ? 'positive' : review.sentiment === '噓' ? 'negative' : 'neutral'}`}>
-                            {review.sentiment}
-                          </span>
-                        ) : review.rating ? (
-                          <span className="review-rating">{'★'.repeat(review.rating)}{'☆'.repeat(5 - review.rating)}</span>
+                  {displayReviews.map((review) => {
+                    const stanceLabel: Record<string, string> = {
+                      supporting: '正面',
+                      opposing: '負面',
+                      neutral: '中性',
+                      unclear: '立場不明',
+                    }
+                    const stance = review.stance ?? null
+                    return (
+                      <article key={review.id} className="crawled-review-card">
+                        <div className="crawled-review-meta">
+                          {stance ? (
+                            <span className={`review-stance-badge stance-${stance}`}>
+                              {stanceLabel[stance] ?? stance}
+                            </span>
+                          ) : null}
+                          {review.sentiment && !stance ? (
+                            <span className={`review-sentiment sentiment-${review.sentiment === '推' ? 'positive' : review.sentiment === '噓' ? 'negative' : 'neutral'}`}>
+                              {review.sentiment}
+                            </span>
+                          ) : review.rating && !stance ? (
+                            <span className="review-rating">{'★'.repeat(review.rating)}{'☆'.repeat(5 - review.rating)}</span>
+                          ) : null}
+                          {review.author ? <span className="review-author">{review.author}</span> : null}
+                          <span className="review-platform-badge">{review.platform}</span>
+                          {review.published_at ? <span className="review-date">{review.published_at.slice(0, 10)}</span> : null}
+                          {review.relevance_score !== null && review.relevance_score !== undefined ? (
+                            <span className="review-relevance" title="AI 判斷與此狗園的相關度">
+                              相關度 {Math.round(review.relevance_score * 100)}%
+                            </span>
+                          ) : null}
+                        </div>
+                        {review.short_summary ? (
+                          <p className="crawled-review-summary">📝 {review.short_summary}</p>
                         ) : null}
-                        {review.author ? <span className="review-author">{review.author}</span> : null}
-                        <span className="review-platform-badge">{review.platform}</span>
-                        {review.published_at ? <span className="review-date">{review.published_at.slice(0, 10)}</span> : null}
-                      </div>
-                      <p className="crawled-review-content">{review.content}</p>
-                      {review.parent_title ? (
-                        <div className="crawled-review-source">
-                          {review.source_url ? (
-                            <a href={review.source_url} target="_blank" rel="noopener noreferrer">{review.parent_title}</a>
-                          ) : (
-                            <span>{review.parent_title}</span>
-                          )}
-                        </div>
-                      ) : null}
-                    </article>
-                  ))}
-                </div>
-              ) : (
-                <div className="empty-review-state">尚未爬取到此對象的評論。可以透過 pipeline 排程爬取。</div>
-              )}
-            </div>
-
-            <div className="reviews-section comment-section">
-              <div className="reviews-header">
-                <h3>使用者評論（{entityPageData?.total_comments ?? 0}）</h3>
-                <p className="reviews-hint">這裡會持續累積針對這個實體的觀察評論，可單獨送出，也可搭配下方附件一起補充。</p>
-              </div>
-              {entityPageData?.comments.length ? (
-                <div className="entity-comment-list">
-                  {entityPageData.comments.map((item) => (
-                    <article key={item.id} className="entity-comment-card">
-                      <div className="entity-comment-top">
-                        <strong>{item.entity_name}</strong>
-                        <span>{formatDateTimeLabel(item.created_at)}</span>
-                      </div>
-                      <p className="entity-comment-body">{item.comment}</p>
-                    </article>
-                  ))}
-                </div>
-              ) : (
-                <div className="empty-review-state">目前還沒有評論，歡迎成為第一位留下觀察的人。</div>
-              )}
-            </div>
-
-            <div className="media-section">
-              <div className="media-header">
-                <h3>📝 留下評論並上傳附件</h3>
-                <p className="media-hint">先寫下你觀察到的內容，再選擇單獨送出評論，或附上照片/影片。支援 JPG、PNG、WebP、GIF、HEIC、MP4、MOV、WebM（單檔最大 200MB）</p>
-              </div>
-
-              <div className="upload-caption-row">
-                <label className="upload-form-label" htmlFor="upload-comment-input">
-                  評論內容
-                </label>
-                <textarea
-                  id="upload-comment-input"
-                  className="caption-input comment-input"
-                  value={uploadComment}
-                  onChange={(e) => setUploadComment(e.target.value)}
-                  placeholder="例如：今天看到欄舍潮濕、有異味，動物活動空間偏小。也可以補充時間、地點與觀察到的情況。"
-                />
-                <div className="comment-action-row">
-                  <button
-                    type="button"
-                    className="search-btn comment-submit-btn"
-                    onClick={() => void handleCommentSubmit()}
-                    disabled={commentSubmitting}
-                  >
-                    {commentSubmitting ? '送出中…' : '先送出評論'}
-                  </button>
-                  <p className="upload-form-hint">你也可以不傳檔案，先單獨送出評論；若接著上傳附件，會自動沿用這段評論一起存進實體頁。</p>
-                </div>
-                {commentError ? <p className="comment-error-text">{commentError}</p> : null}
-              </div>
-
-              <div
-                className={`upload-dropzone${isDragging ? ' dragging' : ''}`}
-                onDragOver={handleDragOver}
-                onDragLeave={handleDragLeave}
-                onDrop={handleDrop}
-                onClick={() => fileInputRef.current?.click()}
-              >
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept="image/*,video/*"
-                  multiple
-                  hidden
-                  onChange={handleFileInputChange}
-                />
-                <div className="dropzone-content">
-                  <span className="dropzone-icon">📁</span>
-                  <p className="dropzone-text">拖拉檔案到此區域，或<strong>點擊選擇檔案</strong></p>
-                  <p className="dropzone-sub">可一次選取多個檔案；若上方已有評論，會先新增到此實體的累積評論區</p>
-                </div>
-              </div>
-
-              {uploadQueue.length > 0 && (
-                <div className="upload-queue">
-                  <div className="queue-header">
-                    <span>上傳佇列（{uploadQueue.length}）</span>
-                    <button type="button" className="clear-done-btn" onClick={clearCompletedUploads}>清除已完成</button>
-                  </div>
-                  {uploadQueue.map((item, idx) => (
-                    <div key={`${item.file.name}-${idx}`} className="queue-item">
-                      <span className="queue-name">{item.file.name}</span>
-                      <span className="queue-size">{formatFileSize(item.file.size)}</span>
-                      <div className="queue-progress-bar">
-                        <div
-                          className={`queue-progress-fill ${item.status}`}
-                          style={{ width: `${item.progress}%` }}
-                        />
-                      </div>
-                      <span className={`queue-status ${item.status}`}>
-                        {item.status === 'pending' && '等待中'}
-                        {item.status === 'uploading' && `${item.progress}%`}
-                        {item.status === 'done' && '✓ 完成'}
-                        {item.status === 'error' && `✗ ${item.errorMsg ?? '失敗'}`}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              {mediaFiles.length > 0 && (
-                <div className="media-gallery">
-                  <h4>已上傳的檔案（{mediaFiles.length}）</h4>
-                  <div className="gallery-grid">
-                    {mediaFiles.map((mf) => (
-                      <div key={mf.id} className="gallery-item">
-                        {mf.media_type === 'image' ? (
-                          <img
-                            src={`${API_BASE_URL}${mf.url}`}
-                            alt={mf.original_name}
-                            className="gallery-thumb"
-                            loading="lazy"
-                          />
-                        ) : (
-                          <div className="gallery-video-thumb">
-                            <span className="video-icon">🎬</span>
-                            <span>{mf.original_name}</span>
+                        <p className="crawled-review-content">{review.content}</p>
+                        {review.parent_title ? (
+                          <div className="crawled-review-source">
+                            {review.source_url ? (
+                              <a href={review.source_url} target="_blank" rel="noopener noreferrer">{review.parent_title}</a>
+                            ) : (
+                              <span>{review.parent_title}</span>
+                            )}
                           </div>
-                        )}
-                        <div className="gallery-info">
-                          <span className="gallery-name" title={mf.original_name}>{mf.original_name}</span>
-                          <span className="gallery-meta">{formatFileSize(mf.file_size)}</span>
-                          {mf.caption ? <p className="gallery-comment">{mf.caption}</p> : null}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
+                        ) : null}
+                        <ReviewRatingBar
+                          reviewId={review.id}
+                          isLoggedIn={authUser.authenticated}
+                          onRequireLogin={() =>
+                            openLoginDialog('給評論打分能計入公信力分數。先用 LINE 登入吧。')
+                          }
+                        />
+                        <ReviewCommentThread
+                          reviewId={review.id}
+                          isLoggedIn={authUser.authenticated}
+                          currentUserId={authUser.id ?? null}
+                          onRequireLogin={() =>
+                            openLoginDialog('想對這則評論補充或反駁？先用 LINE 登入吧。')
+                          }
+                        />
+                      </article>
+                    )
+                  })}
                 </div>
-              )}
-
-              {mediaFiles.length === 0 && uploadQueue.length === 0 ? (
-                <button
-                  type="button"
-                  className="load-media-btn"
-                  onClick={() => void loadMediaFiles(selectedEntityLabel)}
-                >
-                  載入已上傳的檔案
-                </button>
-              ) : null}
+              ) : (
+                <div className="empty-review-state">
+                  {selectedDim ? '目前載入的評論中沒有與這個維度相關的，試試清除篩選或切換平台。' : '尚未爬取到與此狗園相關的評論（AI 過濾後）。'}
+                </div>
+              )
+              })()}
             </div>
 
             {profile ? (
@@ -2238,8 +2223,8 @@ function App() {
         <section className="empty-state" ref={resultSectionRef}>
             <div className="empty-card">
               <div className="empty-icon">🔍</div>
-              <h2>輸入園區名稱開始查詢</h2>
-            <p>搜尋後將顯示全網公開資料摘要、AI 分析重點，以及完整證據列表。</p>
+              <h2>搜尋狗園進入專屬頁面</h2>
+            <p>已收錄的狗園會直接跳到專屬介紹頁，裡面有介紹、各平台評論，以及你自己留下的觀察。沒收錄過的，我們會用 AI 查證後自動建檔。</p>
           </div>
         </section>
       )}
@@ -2251,6 +2236,46 @@ function App() {
           <span>資料來源：Google、Facebook、PTT、Dcard、新聞、官方網站與其他公開平台</span>
         </div>
       </footer>
+
+      <CreateShelterDialog
+        open={dialogStage === 'confirm' || dialogStage === 'verifying'}
+        query={pendingQuery}
+        loading={dialogStage === 'verifying'}
+        error={verifyError}
+        onConfirm={handleVerifyConfirm}
+        onCancel={handleDialogCancel}
+      />
+
+      <VerificationReviewDialog
+        open={dialogStage === 'review' || dialogStage === 'creating'}
+        candidate={candidate}
+        submitting={dialogStage === 'creating'}
+        error={createError}
+        onConfirm={handleCreateConfirm}
+        onCancel={handleDialogCancel}
+      />
+
+      <button
+        type="button"
+        className={`admin-fab${hasAdminToken ? ' active' : ''}`}
+        onClick={() => setAdminTokenDialogOpen(true)}
+        title={hasAdminToken ? '管理員模式已啟用（點擊修改 Token）' : '設定管理員 Token'}
+        aria-label="admin token"
+      >
+        {hasAdminToken ? '🔓' : '🔒'}
+      </button>
+
+      <AdminTokenDialog
+        open={adminTokenDialogOpen}
+        onClose={() => setAdminTokenDialogOpen(false)}
+        onSaved={(token) => setHasAdminToken(Boolean(token))}
+      />
+
+      <LoginDialog
+        open={loginDialogOpen}
+        message={loginDialogMessage}
+        onClose={() => setLoginDialogOpen(false)}
+      />
     </div>
   )
 }

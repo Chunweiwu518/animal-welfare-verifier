@@ -9,6 +9,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 
+from app.auth import require_admin_token
 from app.config import Settings, get_request_settings
 from app.models.media import (
     MediaFileResponse,
@@ -51,7 +52,11 @@ def _get_upload_dir(settings: Settings) -> Path:
     return upload_dir
 
 
-@router.post("/upload", response_model=MediaUploadResponse)
+@router.post(
+    "/upload",
+    response_model=MediaUploadResponse,
+    dependencies=[Depends(require_admin_token)],
+)
 async def upload_media(
     request: Request,
     file: UploadFile = File(...),
@@ -173,7 +178,7 @@ async def media_stats(
     return persistence.get_media_stats(entity_name=entity_name)
 
 
-@router.delete("/{file_id}")
+@router.delete("/{file_id}", dependencies=[Depends(require_admin_token)])
 async def delete_media(
     file_id: int,
     settings: Settings = Depends(get_request_settings),

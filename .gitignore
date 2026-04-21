@@ -17,3 +17,4 @@ backend/.ruff_cache/
 backend/animal_welfare.db
 backend/data/
 backend/static/
+backend/.crawl-logs/

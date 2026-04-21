@@ -62,6 +62,8 @@ class EntityCommentResponse(BaseModel):
     entity_name: str
     comment: str
     created_at: str
+    display_name: str = ""
+    avatar_url: str = ""
 
 
 class EntityPageResponse(BaseModel):

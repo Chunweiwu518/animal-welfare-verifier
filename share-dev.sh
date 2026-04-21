@@ -6,9 +6,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$SCRIPT_DIR"
 LOG_DIR="$PROJECT_ROOT/.dev-logs"
 CLOUDFLARED_DIR="$PROJECT_ROOT/.dev-tools"
+SYSTEM_CLOUDFLARED_BIN="$(command -v cloudflared || true)"
 CLOUDFLARED_BIN="$CLOUDFLARED_DIR/cloudflared"
 APP_LOG="$LOG_DIR/share-dev-app.log"
 TUNNEL_LOG="$LOG_DIR/share-dev-tunnel.log"
+PUBLIC_URL_FILE="$LOG_DIR/share-dev-public-url.txt"
 FRONTEND_URL="http://127.0.0.1:9488"
 HEALTH_URL="http://127.0.0.1:9487/api/health"
 
@@ -54,6 +56,11 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 ensure_cloudflared() {
+    if [ -n "$SYSTEM_CLOUDFLARED_BIN" ]; then
+        CLOUDFLARED_BIN="$SYSTEM_CLOUDFLARED_BIN"
+        return 0
+    fi
+
     if [ -x "$CLOUDFLARED_BIN" ]; then
         return 0
     fi
@@ -87,6 +94,7 @@ wait_for_tunnel_url() {
 
 : > "$APP_LOG"
 : > "$TUNNEL_LOG"
+rm -f "$PUBLIC_URL_FILE"
 
 ensure_cloudflared
 
@@ -116,11 +124,13 @@ PUBLIC_URL="$(wait_for_tunnel_url)" || {
 }
 
 log "開發環境已對外分享"
+printf '%s\n' "$PUBLIC_URL" > "$PUBLIC_URL_FILE"
 printf '本機前端: %s\n' "$FRONTEND_URL"
 printf '本機後端: http://127.0.0.1:9487\n'
 printf '對外網址: %s\n' "$PUBLIC_URL"
 printf '應用程式日誌: %s\n' "$APP_LOG"
 printf 'Tunnel 日誌: %s\n' "$TUNNEL_LOG"
+printf '對外網址檔案: %s\n' "$PUBLIC_URL_FILE"
 printf '按 Ctrl+C 可同時停止開發環境與 Tunnel\n'
 
 wait "$APP_PID"

@@ -82,7 +82,7 @@ class CrawlOrchestrator:
         max_results: int = 50,
     ) -> dict[str, int]:
         """Run one pipeline for all watchlist entities."""
-        entities = self.persistence.list_due_watchlist_entities()
+        entities = self.persistence.list_due_watchlist_entities(limit=200)
         results: dict[str, int] = {}
         for entity in entities:
             name = entity.entity_name

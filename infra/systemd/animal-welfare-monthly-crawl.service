@@ -1,0 +1,12 @@
+[Unit]
+Description=Animal Welfare Verifier — Monthly Full-Platform Crawl
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/steven/animal-welfare-verifier
+ExecStart=/home/steven/animal-welfare-verifier/scripts/monthly-full-crawl.sh
+TimeoutStartSec=7200
+StandardOutput=journal
+StandardError=journal

@@ -61,6 +61,16 @@ class Settings(BaseSettings):
     crawl4ai_url_limit: int = 18
     crawl4ai_timeout_seconds: int = 12
     openai_timeout_seconds: int = 8
+    tavily_api_key: str | None = None
+    shelter_verification_timeout_seconds: int = 30
+    shelter_verification_max_tool_calls: int = 4
+    shelter_default_refresh_interval_hours: int = 720  # monthly
+    admin_token: str | None = None
+    line_channel_id: str | None = None
+    line_channel_secret: str | None = None
+    line_redirect_uri: str | None = None
+    session_cookie_name: str = "aw_session"
+    session_ttl_days: int = 30
 
     model_config = SettingsConfigDict(
         env_file=".env",
