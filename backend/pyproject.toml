@@ -17,6 +17,7 @@ dependencies = [
   "trafilatura>=2.0.0",
   "uvicorn[standard]>=0.34.0",
   "apify-client>=2.5.0",
+  "boto3>=1.42.93",
 ]
 
 [project.optional-dependencies]

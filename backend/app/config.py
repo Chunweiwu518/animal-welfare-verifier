@@ -71,6 +71,12 @@ class Settings(BaseSettings):
     line_redirect_uri: str | None = None
     session_cookie_name: str = "aw_session"
     session_ttl_days: int = 30
+    r2_account_id: str | None = None
+    r2_bucket: str | None = None
+    r2_endpoint: str | None = None
+    r2_access_key_id: str | None = None
+    r2_secret_access_key: str | None = None
+    r2_public_url: str | None = None  # optional custom domain like https://media.example.com
 
     model_config = SettingsConfigDict(
         env_file=".env",

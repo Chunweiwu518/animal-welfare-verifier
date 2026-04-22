@@ -1,23 +1,22 @@
-"""Media upload and serving routes."""
+"""Media upload routes. Storage backend is Cloudflare R2 — no local disk writes."""
 
 from __future__ import annotations
 
 import logging
 import uuid
-from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import RedirectResponse
 
 from app.auth import require_admin_token
 from app.config import Settings, get_request_settings
 from app.models.media import (
-    MediaFileResponse,
     MediaListResponse,
     MediaStatsResponse,
     MediaUploadResponse,
 )
 from app.services.persistence_service import PersistenceService
+from app.services.r2_storage import get_r2_storage
 
 logger = logging.getLogger(__name__)
 
@@ -46,12 +45,6 @@ EXTENSION_MAP = {
 }
 
 
-def _get_upload_dir(settings: Settings) -> Path:
-    upload_dir = Path(settings.media_upload_dir)
-    upload_dir.mkdir(parents=True, exist_ok=True)
-    return upload_dir
-
-
 @router.post(
     "/upload",
     response_model=MediaUploadResponse,
@@ -65,8 +58,7 @@ async def upload_media(
     caption: str = Form(""),
     settings: Settings = Depends(get_request_settings),
 ) -> MediaUploadResponse:
-    """Upload a photo or video file with an optional comment."""
-    # Validate content type
+    """Upload a photo or video to R2."""
     content_type = file.content_type or ""
     if content_type not in ALLOWED_TYPES:
         raise HTTPException(
@@ -74,46 +66,37 @@ async def upload_media(
             detail=f"不支援的檔案類型：{content_type}。支援的類型：圖片 (JPEG, PNG, WebP, GIF, HEIC) 和影片 (MP4, MOV, WebM, AVI, MKV)。",
         )
 
-    # Read file content
     content = await file.read()
     file_size = len(content)
 
-    # Validate file size
     max_bytes = settings.max_upload_size_mb * 1024 * 1024
     if file_size > max_bytes:
         raise HTTPException(
             status_code=400,
             detail=f"檔案太大（{file_size / 1024 / 1024:.1f} MB），最大允許 {settings.max_upload_size_mb} MB。",
         )
-
     if file_size == 0:
         raise HTTPException(status_code=400, detail="檔案為空。")
 
-    # Generate unique filename
     ext = EXTENSION_MAP.get(content_type, "")
     unique_name = f"{uuid.uuid4().hex}{ext}"
     media_type = "image" if content_type in ALLOWED_IMAGE_TYPES else "video"
+    key = f"media/{media_type}/{unique_name}"
 
-    # Save to disk
-    upload_dir = _get_upload_dir(settings)
-    file_path = upload_dir / unique_name
-    file_path.write_bytes(content)
+    storage = get_r2_storage(settings)
+    storage.upload_bytes(content, key=key, content_type=content_type)
 
-    # Try to get image dimensions
-    width, height = None, None
+    width, height = (None, None)
     if media_type == "image":
         width, height = _get_image_dimensions(content)
 
-    # Get uploader IP
     uploader_ip = request.client.host if request.client else ""
-
     normalized_caption = comment.strip() or caption.strip()
 
-    # Save metadata to DB
     persistence = PersistenceService(settings)
     file_id = persistence.save_media_file(
         entity_name=entity_name.strip(),
-        file_name=unique_name,
+        file_name=key,
         original_name=file.filename or "unknown",
         media_type=media_type,
         mime_type=content_type,
@@ -131,23 +114,16 @@ async def upload_media(
     return MediaUploadResponse(file=media_record)
 
 
-@router.get("/file/{file_name}")
+@router.get("/file/{file_name:path}")
 async def serve_media_file(
     file_name: str,
     settings: Settings = Depends(get_request_settings),
-) -> FileResponse:
-    """Serve a media file by its stored filename."""
-    upload_dir = _get_upload_dir(settings)
-    file_path = upload_dir / file_name
-
-    if not file_path.exists() or not file_path.is_file():
-        raise HTTPException(status_code=404, detail="檔案不存在")
-
-    # Security: prevent path traversal
-    if not file_path.resolve().is_relative_to(upload_dir.resolve()):
-        raise HTTPException(status_code=403, detail="禁止存取")
-
-    return FileResponse(file_path)
+) -> RedirectResponse:
+    """Redirect to the R2 public/presigned URL for the given object key."""
+    if ".." in file_name or file_name.startswith("/"):
+        raise HTTPException(status_code=400, detail="Invalid key")
+    storage = get_r2_storage(settings)
+    return RedirectResponse(url=storage.url_for(file_name), status_code=302)
 
 
 @router.get("/list", response_model=MediaListResponse)
@@ -158,7 +134,6 @@ async def list_media(
     offset: int = 0,
     settings: Settings = Depends(get_request_settings),
 ) -> MediaListResponse:
-    """List uploaded media files, optionally filtered by entity or type."""
     persistence = PersistenceService(settings)
     return persistence.list_media_files(
         entity_name=entity_name,
@@ -173,7 +148,6 @@ async def media_stats(
     entity_name: str | None = None,
     settings: Settings = Depends(get_request_settings),
 ) -> MediaStatsResponse:
-    """Get media upload statistics."""
     persistence = PersistenceService(settings)
     return persistence.get_media_stats(entity_name=entity_name)
 
@@ -183,30 +157,23 @@ async def delete_media(
     file_id: int,
     settings: Settings = Depends(get_request_settings),
 ) -> dict[str, str]:
-    """Delete a media file."""
     persistence = PersistenceService(settings)
     record = persistence.get_media_file(file_id)
     if not record:
         raise HTTPException(status_code=404, detail="檔案不存在")
 
-    # Delete from disk
-    upload_dir = _get_upload_dir(settings)
-    file_path = upload_dir / record.file_name
-    if file_path.exists():
-        file_path.unlink()
-
-    # Delete from DB
+    storage = get_r2_storage(settings)
+    storage.delete(record.file_name)
     persistence.delete_media_file(file_id)
     return {"status": "ok"}
 
 
 def _get_image_dimensions(content: bytes) -> tuple[int | None, int | None]:
-    """Try to extract image dimensions from raw bytes."""
     try:
-        from PIL import Image
         import io
+
+        from PIL import Image
         img = Image.open(io.BytesIO(content))
-        return img.size  # (width, height)
+        return img.size
     except Exception:
         return None, None
-

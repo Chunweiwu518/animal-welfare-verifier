@@ -14,9 +14,9 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+import io
 import json
 import uuid
-from pathlib import Path as PathLib
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 from app.config import Settings, get_request_settings
 from app.routes.auth import current_user, require_user
 from app.services.auth_service import AuthUser
+from app.services.r2_storage import get_r2_storage
 
 router = APIRouter(prefix="/api", tags=["ratings"])
 
@@ -83,32 +84,32 @@ async def upload_review_attachment(
     media_type = "image" if ct in ALLOWED_IMAGE_TYPES else "video"
     max_mb = MAX_IMAGE_MB if media_type == "image" else MAX_VIDEO_MB
 
-    upload_dir = PathLib(settings.media_upload_dir)
-    upload_dir.mkdir(parents=True, exist_ok=True)
     ext = EXT_MAP.get(ct, ".bin")
     filename = f"ua-{user.id}-{uuid.uuid4().hex}{ext}"
-    dest = upload_dir / filename
+    key = f"review-attachments/{media_type}/{filename}"
 
-    # Stream to disk with size guard
     size_limit = max_mb * 1024 * 1024
+    buf = io.BytesIO()
     size = 0
-    with dest.open("wb") as fh:
-        while True:
-            chunk = await file.read(1024 * 1024)
-            if not chunk:
-                break
-            size += len(chunk)
-            if size > size_limit:
-                fh.close()
-                dest.unlink(missing_ok=True)
-                raise HTTPException(
-                    status_code=413,
-                    detail=f"檔案過大（上限 {max_mb} MB）",
-                )
-            fh.write(chunk)
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        size += len(chunk)
+        if size > size_limit:
+            raise HTTPException(
+                status_code=413,
+                detail=f"檔案過大（上限 {max_mb} MB）",
+            )
+        buf.write(chunk)
+
+    buf.seek(0)
+    storage = get_r2_storage(settings)
+    result = storage.upload_stream(buf, key=key, content_type=ct, size=size)
 
     return {
-        "url": f"/api/media/file/{filename}",
+        "url": result.url,
+        "key": key,
         "media_type": media_type,
         "size": size,
     }
