@@ -361,6 +361,7 @@ async def entity_dimensions(
                    r.published_at, r.dimension_tags_json, r.relevance_score
             FROM reviews r
             WHERE r.entity_id = ? AND r.relevance_score >= 0.6
+              AND (r.content_type IS NULL OR r.content_type = 'review')
               AND r.dimension_tags_json IS NOT NULL
               AND r.dimension_tags_json != '[]'
             """,
@@ -453,6 +454,7 @@ async def entity_credibility(
             FROM reviews r
             LEFT JOIN review_ratings rr ON rr.review_id = r.id
             WHERE r.entity_id = ?
+              AND (r.content_type IS NULL OR r.content_type = 'review')
             GROUP BY r.id
             HAVING rater_count > 0
             """,

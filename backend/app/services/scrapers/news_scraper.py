@@ -28,6 +28,10 @@ async def crawl_news_reviews(
         f"{entity_name}",
         f"{entity_name} 評價",
         f"{entity_name} 動物",
+        # site-restricted queries to pick up Mobile01 / 巴哈姆特 forum threads
+        # that do not surface in regular news.google.com results
+        f"{entity_name} site:mobile01.com",
+        f"{entity_name} site:forum.gamer.com.tw",
     ]
 
     raw_results = await service.search_reviews(queries)

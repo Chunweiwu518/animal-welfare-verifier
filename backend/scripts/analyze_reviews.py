@@ -79,6 +79,7 @@ async def main() -> None:
     total_done = 0
     stats = {"relevant": 0, "borderline": 0, "noise": 0}
     stance_count: dict[str, int] = defaultdict(int)
+    content_type_count: dict[str, int] = defaultdict(int)
 
     for entity_id, items in per_entity.items():
         entity_name = items[0]["entity_name"]
@@ -102,13 +103,14 @@ async def main() -> None:
                 conn.execute(
                     """
                     UPDATE reviews
-                    SET relevance_score=?, stance=?, short_summary=?, analyzed_at=CURRENT_TIMESTAMP
+                    SET relevance_score=?, stance=?, short_summary=?, content_type=?, analyzed_at=CURRENT_TIMESTAMP
                     WHERE id=?
                     """,
                     (
                         analysis.relevance_score,
                         analysis.stance,
                         analysis.short_summary,
+                        analysis.content_type,
                         row["id"],
                     ),
                 )
@@ -119,6 +121,7 @@ async def main() -> None:
                 else:
                     stats["noise"] += 1
                 stance_count[analysis.stance] += 1
+                content_type_count[analysis.content_type] += 1
 
             conn.commit()
             total_done += len(batch)
@@ -131,10 +134,11 @@ async def main() -> None:
             )
 
     logger.info(
-        "DONE. Analyzed %d reviews. Relevance: %s. Stance: %s",
+        "DONE. Analyzed %d reviews. Relevance: %s. Stance: %s. ContentType: %s",
         total_done,
         stats,
         dict(stance_count),
+        dict(content_type_count),
     )
 
 

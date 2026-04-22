@@ -199,6 +199,61 @@ async def crawl_facebook_posts(
     return reviews
 
 
+async def crawl_facebook_groups(
+    group_urls: list[str],
+    apify_token: str,
+    max_posts_per_group: int = 50,
+) -> list[dict]:
+    """Crawl recent posts from a list of public Facebook groups.
+
+    Returns a flat list of post dicts (unfiltered by entity). Caller filters
+    by keyword match. Uses apify/facebook-groups-scraper.
+    """
+    if not apify_token or not group_urls:
+        return []
+    try:
+        from apify_client import ApifyClient
+    except ImportError:
+        logger.warning("apify-client not installed")
+        return []
+
+    client = ApifyClient(apify_token)
+    now = _now()
+
+    items = _safe_call_actor(
+        client,
+        "apify/facebook-groups-scraper",
+        {
+            "startUrls": [{"url": u} for u in group_urls],
+            "resultsLimit": max_posts_per_group,
+        },
+        timeout_secs=600,
+    )
+
+    posts: list[dict] = []
+    for item in items:
+        text = str(item.get("text") or item.get("message") or "").strip()
+        if not text:
+            continue
+        posts.append({
+            "content": text[:1500],
+            "author": (
+                item.get("user", {}).get("name")
+                if isinstance(item.get("user"), dict)
+                else item.get("authorName") or ""
+            ),
+            "source_url": item.get("url") or item.get("postUrl") or "",
+            "group_url": item.get("groupUrl") or item.get("facebookUrl") or "",
+            "group_name": item.get("groupName") or "",
+            "likes": int(item.get("likesCount") or 0),
+            "published_at": item.get("time") or item.get("timestamp"),
+            "fetched_at": now,
+        })
+
+    logger.info("Apify FB groups scraped=%d posts=%d", len(group_urls), len(posts))
+    return posts
+
+
 async def crawl_facebook_comments(
     entity_name: str,
     apify_token: str,

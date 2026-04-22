@@ -1428,6 +1428,7 @@ class PersistenceService:
         offset: int = 0,
         min_relevance: float | None = 0.6,
         include_unanalyzed: bool = True,
+        only_reviews: bool = True,
     ) -> list[dict]:
         """Fetch reviews for an entity, optionally filtered by LLM relevance score.
 
@@ -1435,6 +1436,8 @@ class PersistenceService:
           Set to None to disable filtering.
         include_unanalyzed: if True, also include reviews where analyzed_at IS NULL
           (analysis not yet run). Useful while analyzer is still catching up.
+        only_reviews: if True, exclude rows classified as self_post/announcement/news/unrelated.
+          Rows with NULL content_type (not yet classified) are still included.
         """
         with self._connect() as connection:
             entity_row = self._find_entity_by_name_or_alias(connection, entity_name)
@@ -1452,6 +1455,8 @@ class PersistenceService:
                 else:
                     where += " AND r.relevance_score >= ?"
                 params.append(float(min_relevance))
+            if only_reviews:
+                where += " AND (r.content_type IS NULL OR r.content_type = 'review')"
             params.extend([max(1, limit), max(0, offset)])
             rows = connection.execute(
                 f"""
@@ -1459,6 +1464,7 @@ class PersistenceService:
                        r.rating, r.source_url, r.parent_title, r.likes,
                        r.published_at, r.fetched_at,
                        r.relevance_score, r.stance, r.short_summary,
+                       r.content_type,
                        r.dimension_tags_json
                 FROM reviews r
                 {where}
@@ -1662,8 +1668,15 @@ class PersistenceService:
             connection.execute(
                 "ALTER TABLE reviews ADD COLUMN dimensions_classified_at TEXT"
             )
+        if "content_type" not in columns:
+            connection.execute(
+                "ALTER TABLE reviews ADD COLUMN content_type TEXT"
+            )
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_reviews_analyzed ON reviews(entity_id, analyzed_at)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_reviews_content_type ON reviews(entity_id, content_type)"
         )
 
     def _ensure_search_query_columns(self, connection: sqlite3.Connection) -> None:

@@ -1,0 +1,55 @@
+{
+  "note": "Public Taiwan animal-welfare FB groups for future Apify Groups-Scraper integration. Curated 2026-04-21.",
+  "groups": [
+    {
+      "url": "https://www.facebook.com/groups/1282129502137147/",
+      "name": "收養幼犬幼貓，寄養，免費認養",
+      "topic": "adoption"
+    },
+    {
+      "url": "https://www.facebook.com/groups/186237321460293/",
+      "name": "寵物認養/領養/送養/協尋/救援/愛心訊息交流專區",
+      "topic": "adoption_rescue"
+    },
+    {
+      "url": "https://www.facebook.com/groups/223546961053691/",
+      "name": "認養大型犬-台灣",
+      "topic": "adoption_large_dogs"
+    },
+    {
+      "url": "https://www.facebook.com/groups/623186221112430/",
+      "name": "流浪動物相關社團 (TBD 實名)",
+      "topic": "stray_animals"
+    }
+  ],
+  "pages_for_reference_only": [
+    {
+      "url": "https://www.facebook.com/doghome/",
+      "name": "流浪動物花園協會"
+    },
+    {
+      "url": "https://www.facebook.com/dogcat.org.Taipei/",
+      "name": "社團法人台灣流浪貓狗關懷協會"
+    },
+    {
+      "url": "https://www.facebook.com/ARTT.saveDOGS/",
+      "name": "台灣動物緊急救援小組"
+    },
+    {
+      "url": "https://www.facebook.com/dog1314/",
+      "name": "社團法人台灣幸福狗流浪中途協會"
+    },
+    {
+      "url": "https://www.facebook.com/meetpets/",
+      "name": "台灣認養地圖 meetpets"
+    },
+    {
+      "url": "https://www.facebook.com/animalsright/",
+      "name": "台灣動物保護行政監督聯盟"
+    },
+    {
+      "url": "https://www.facebook.com/taiwanchangmama/",
+      "name": "張媽媽流浪動物之家"
+    }
+  ]
+}

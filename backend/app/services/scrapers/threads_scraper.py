@@ -125,6 +125,23 @@ def _parse_threads_posts(body_text: str, source_url: str, fetched_at: str) -> li
         "暢所欲言", "加入", "© 2", "翻譯",
     ]
 
+    # Lines matching these are preview cards / embed titles for linked media,
+    # not actual user-written content. E.g.
+    #   "XXX 協會（@xxx）• Instagram 相片與影片"
+    #   "facebook.com/share…"
+    #   "instagram.com/tssda…"
+    #   "youtube.com/@fruit…"
+    #   "YT 短影 - > youtube.com/@..."
+    EMBED_PATTERNS = [
+        "• Instagram ", "Instagram 相片與影片", "• Threads",
+        "• Facebook", "Facebook 貼文",
+    ]
+    URL_PREVIEW_RE = re.compile(
+        r"^(https?://|www\.)?"
+        r"(instagram\.com|facebook\.com|youtube\.com|youtu\.be|fb\.com|threads\.net|t\.co)[/\w@.]*[…\.]+$"
+    )
+    NUM_WITH_COMMA_RE = re.compile(r"^[\d,]+$")
+
     i = 0
     current_author = None
     while i < len(lines):
@@ -135,13 +152,26 @@ def _parse_threads_posts(body_text: str, source_url: str, fetched_at: str) -> li
             i += 1
             continue
 
+        # Skip embed card / profile preview titles
+        if any(pat in line for pat in EMBED_PATTERNS):
+            i += 1
+            continue
+
+        # Skip truncated URL previews (pure link cards with no user commentary)
+        if URL_PREVIEW_RE.match(line):
+            i += 1
+            continue
+
         # Detect username pattern (short line, no spaces, possibly with dots/underscores)
         if len(line) < 40 and re.match(r"^[a-zA-Z0-9._]+$", line):
             current_author = line
             i += 1
             continue
 
-        # Detect engagement line (likes/replies counts)
+        # Detect engagement line (likes/replies counts, possibly with commas)
+        if NUM_WITH_COMMA_RE.match(line):
+            i += 1
+            continue
         if re.match(r"^\d+$", line) and int(line) < 100000:
             i += 1
             continue
@@ -151,8 +181,9 @@ def _parse_threads_posts(body_text: str, source_url: str, fetched_at: str) -> li
             i += 1
             continue
 
-        # This looks like actual content
-        if len(line) >= 5 and current_author:
+        # This looks like actual content. Require at least 10 chars of real text
+        # (Chinese post/reply worth analyzing) and presence of non-URL substance.
+        if len(line) >= 10 and current_author:
             reviews.append({
                 "content": line[:500],
                 "author": current_author,

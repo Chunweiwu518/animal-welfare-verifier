@@ -14,6 +14,8 @@ import app.pipelines.threads_pipeline  # noqa: F401
 import app.pipelines.google_maps_pipeline  # noqa: F401
 import app.pipelines.instagram_pipeline  # noqa: F401
 import app.pipelines.facebook_pipeline  # noqa: F401
+import app.pipelines.mobile01_pipeline  # noqa: F401
+import app.pipelines.facebook_groups_pipeline  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
