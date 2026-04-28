@@ -252,12 +252,14 @@ async def get_entity_reviews(
     offset: int = 0,
     min_relevance: float | None = 0.6,
     include_all: bool = False,
+    include_unanalyzed: bool = False,
     settings: Settings = Depends(get_request_settings),
 ) -> list[dict]:
     """Get reviews filtered by LLM relevance score (default >=0.6).
 
     - min_relevance: override the threshold (0 disables filter).
     - include_all: if True, ignore relevance filter entirely (raw data).
+    - include_unanalyzed: if True, include rows that have not completed AI filtering.
     """
     persistence_service = PersistenceService(settings)
     return persistence_service.get_reviews(
@@ -266,6 +268,7 @@ async def get_entity_reviews(
         limit=min(max(limit, 1), 100),
         offset=max(offset, 0),
         min_relevance=None if include_all else min_relevance,
+        include_unanalyzed=include_unanalyzed,
     )
 
 

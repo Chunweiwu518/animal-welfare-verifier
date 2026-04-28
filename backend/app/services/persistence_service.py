@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +25,8 @@ from app.models.profile import (
 from app.models.search import BalancedSummary, EvidenceCard
 from app.models.watchlist import WatchlistEntity
 from app.seed_data import ENTITY_PAGE_SEED, WATCHLIST_SEED, question_templates_for
+
+logger = logging.getLogger(__name__)
 
 
 class PersistenceService:
@@ -1427,7 +1430,7 @@ class PersistenceService:
         limit: int = 20,
         offset: int = 0,
         min_relevance: float | None = 0.6,
-        include_unanalyzed: bool = True,
+        include_unanalyzed: bool = False,
         only_reviews: bool = True,
     ) -> list[dict]:
         """Fetch reviews for an entity, optionally filtered by LLM relevance score.
@@ -1437,7 +1440,7 @@ class PersistenceService:
         include_unanalyzed: if True, also include reviews where analyzed_at IS NULL
           (analysis not yet run). Useful while analyzer is still catching up.
         only_reviews: if True, exclude rows classified as self_post/announcement/news/unrelated.
-          Rows with NULL content_type (not yet classified) are still included.
+          Set include_unanalyzed=True to include rows with NULL content_type.
         """
         with self._connect() as connection:
             entity_row = self._find_entity_by_name_or_alias(connection, entity_name)
@@ -1456,7 +1459,10 @@ class PersistenceService:
                     where += " AND r.relevance_score >= ?"
                 params.append(float(min_relevance))
             if only_reviews:
-                where += " AND (r.content_type IS NULL OR r.content_type = 'review')"
+                if include_unanalyzed:
+                    where += " AND (r.content_type IS NULL OR r.content_type = 'review')"
+                else:
+                    where += " AND r.content_type = 'review'"
             params.extend([max(1, limit), max(0, offset)])
             rows = connection.execute(
                 f"""
@@ -1485,14 +1491,34 @@ class PersistenceService:
                 results.append(d)
             return results
 
-    def get_review_stats(self, entity_name: str) -> dict[str, int]:
+    def get_review_stats(
+        self,
+        entity_name: str,
+        *,
+        min_relevance: float | None = 0.6,
+        include_unanalyzed: bool = False,
+        only_reviews: bool = True,
+    ) -> dict[str, int]:
         with self._connect() as connection:
             entity_row = self._find_entity_by_name_or_alias(connection, entity_name)
             if not entity_row:
                 return {}
+            params: list[object] = [int(entity_row["id"])]
+            where = "WHERE entity_id = ?"
+            if min_relevance is not None:
+                if include_unanalyzed:
+                    where += " AND (analyzed_at IS NULL OR relevance_score >= ?)"
+                else:
+                    where += " AND relevance_score >= ?"
+                params.append(float(min_relevance))
+            if only_reviews:
+                if include_unanalyzed:
+                    where += " AND (content_type IS NULL OR content_type = 'review')"
+                else:
+                    where += " AND content_type = 'review'"
             rows = connection.execute(
-                "SELECT platform, COUNT(*) AS cnt FROM reviews WHERE entity_id = ? GROUP BY platform",
-                (int(entity_row["id"]),),
+                f"SELECT platform, COUNT(*) AS cnt FROM reviews {where} GROUP BY platform",
+                params,
             ).fetchall()
             return {str(row["platform"]): int(row["cnt"]) for row in rows}
 

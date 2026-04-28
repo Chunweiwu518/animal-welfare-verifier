@@ -49,7 +49,7 @@ async def main() -> None:
     conn = sqlite3.connect(settings.database_path)
     conn.row_factory = sqlite3.Row
 
-    where = "WHERE r.relevance_score >= ?"
+    where = "WHERE r.relevance_score >= ? AND r.content_type = 'review'"
     params: list = [MIN_RELEVANCE]
     if not args.all:
         where += " AND r.dimensions_classified_at IS NULL"

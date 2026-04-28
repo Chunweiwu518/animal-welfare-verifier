@@ -593,6 +593,7 @@
   color: #3c4043;
   line-height: 1.8;
   font-size: 0.95rem;
+  overflow-wrap: anywhere;
 }
 
 .entity-tags {
@@ -627,6 +628,7 @@
   font-size: 1rem;
   font-weight: 700;
   color: #21483f;
+  overflow-wrap: anywhere;
 }
 
 .entity-page-hero {
@@ -646,6 +648,7 @@
   color: #4e665f;
   font-size: 0.88rem;
   font-weight: 600;
+  overflow-wrap: anywhere;
 }
 
 .entity-page-cover {
@@ -1181,6 +1184,8 @@
 .review-url {
   font-size: 0.78rem;
   color: #80868b;
+  max-width: 100%;
+  overflow-wrap: anywhere;
 }
 
 .view-original {
@@ -1612,6 +1617,7 @@
   line-height: 1.5;
   color: #35594f;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .entity-comment-list {
@@ -1642,6 +1648,7 @@
   line-height: 1.7;
   color: #2f413b;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .load-media-btn {
@@ -1885,16 +1892,20 @@
   font-size: 0.9rem;
   line-height: 1.6;
   color: var(--text-primary, #1a202c);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .crawled-review-source {
   margin-top: 6px;
   font-size: 0.78rem;
+  overflow-wrap: anywhere;
 }
 
 .crawled-review-source a {
   color: var(--accent, #0d9488);
   text-decoration: none;
+  overflow-wrap: anywhere;
 }
 
 .crawled-review-source a:hover {
@@ -1939,6 +1950,7 @@
   border-left: 3px solid #e8b54a;
   padding: 0.35rem 0.6rem;
   border-radius: 4px;
+  overflow-wrap: anywhere;
 }
 .review-relevance {
   font-size: 0.72rem;

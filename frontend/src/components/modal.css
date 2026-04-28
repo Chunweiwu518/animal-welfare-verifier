@@ -485,7 +485,12 @@
   font-weight: 600;
 }
 
-.review-thread-name { color: #1a1d23; font-weight: 600; }
+.review-thread-name {
+  color: #1a1d23;
+  font-weight: 600;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
 .review-thread-date { color: #9aa0a6; font-size: 0.75rem; margin-left: auto; }
 
 .review-thread-delete {
@@ -504,6 +509,7 @@
   color: #1a1d23;
   line-height: 1.55;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .review-thread-compose textarea {
@@ -755,6 +761,7 @@
   border-radius: 5px;
   background: #fff;
   border-left: 2px solid transparent;
+  overflow-wrap: anywhere;
 }
 .dim-excerpt-supporting { border-left-color: #2eb67d; }
 .dim-excerpt-opposing { border-left-color: #d9534f; }

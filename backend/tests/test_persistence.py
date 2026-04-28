@@ -177,6 +177,58 @@ def test_persistence_service_lists_entities(tmp_path: Path) -> None:
     assert "木柵動物園" in response.items[0].aliases
 
 
+def test_public_reviews_only_include_analyzed_review_content(tmp_path: Path) -> None:
+    db_path = tmp_path / "test_reviews.db"
+    settings = Settings(database_path=str(db_path))
+    service = PersistenceService(settings)
+    service.initialize()
+    service.save_reviews(
+        "測試狗園",
+        "facebook_posts",
+        [
+            {
+                "author": "園方",
+                "content": "每天除了吃飯睡覺，其他時間都在陪伴不同的毛孩。",
+                "source_url": "https://facebook.example/self",
+            },
+            {
+                "author": "訪客",
+                "content": "工作人員很細心照顧牠們。",
+                "source_url": "https://facebook.example/review",
+            },
+            {
+                "author": "未分析",
+                "content": "還沒跑完 AI 分析的內容。",
+                "source_url": "https://facebook.example/pending",
+            },
+        ],
+    )
+
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            UPDATE reviews
+            SET relevance_score = 0.95, content_type = 'self_post', analyzed_at = CURRENT_TIMESTAMP
+            WHERE author = '園方'
+            """,
+        )
+        connection.execute(
+            """
+            UPDATE reviews
+            SET relevance_score = 0.9, content_type = 'review', analyzed_at = CURRENT_TIMESTAMP
+            WHERE author = '訪客'
+            """,
+        )
+
+    public_reviews = service.get_reviews("測試狗園")
+    permissive_reviews = service.get_reviews("測試狗園", include_unanalyzed=True)
+    stats = service.get_review_stats("測試狗園")
+
+    assert [item["author"] for item in public_reviews] == ["訪客"]
+    assert {item["author"] for item in permissive_reviews} == {"訪客", "未分析"}
+    assert stats == {"facebook_posts": 1}
+
+
 def test_persistence_service_caches_and_reads_raw_sources(tmp_path: Path) -> None:
     db_path = tmp_path / "test_cache.db"
     settings = Settings(database_path=str(db_path))

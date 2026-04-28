@@ -197,34 +197,8 @@ const DEFAULT_API_BASE_URL =
     : ''
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? DEFAULT_API_BASE_URL
 
-const COMMON_QUESTIONS = [
-  '近期整體資訊是偏正面還是偏負面？',
-  '有哪些真實心得、官方說法與第三方資料？',
-  '最近是否有照護爭議、聲明或負面新聞？',
-  'Google、PTT、社群與新聞上怎麼說？',
-]
-
-const ANIMAL_FOCUS_QUESTIONS = [
-  '是否可能涉及動保法、虐待、棄養或超收問題？',
-  '有哪些內容明確提到動物福利、照護或飼養環境疑慮？',
-  '最近是否有收容、繁殖、救援、醫療或死亡相關爭議？',
-  '目前公開資料可支持哪些動物福利疑慮，哪些部分仍待查？',
-]
-
 const PLATFORM_LABELS = ['Google', 'Facebook', 'Instagram', 'Threads', 'Dcard', 'PTT', '新聞', '官方']
 const SEARCH_SESSION_STORAGE_KEY = 'animal-welfare-search-session-v1'
-const SEARCH_PROGRESS_STEPS = [
-  '正在展開爭議、聲明、評論與募資等查詢詞',
-  '正在整理 Firecrawl、PTT 與其他公開來源',
-  '正在清洗內文並挑出可讀的證據摘錄',
-] as const
-
-const ANIMAL_SEARCH_PROGRESS_STEPS = [
-  '正在展開動保法、動物福利、照護與稽查相關查詢詞',
-  '正在優先整理與收容、繁殖、虐待、棄養有關的公開來源',
-  '正在排除非動物相關內容並保守整理可引用證據',
-] as const
-
 type PlatformTab = '全部來源' | typeof PLATFORM_LABELS[number]
 type SearchSessionState = {
   entityName: string
@@ -296,11 +270,6 @@ function getModeLabel(mode: SearchResponse['mode'] | null) {
   }
 
   return '待搜尋'
-}
-
-function getSearchModeLabel(result: SearchResponse | null, animalFocus: boolean) {
-  const focusEnabled = result?.animal_focus ?? animalFocus
-  return focusEnabled ? '動保法模式' : '一般模式'
 }
 
 function getStanceLabel(stance: EvidenceCard['stance']) {
@@ -438,6 +407,18 @@ function getPublishedDateLabel(card: EvidenceCard) {
 
 function formatDateTimeLabel(value: string) {
   return value.includes('T') ? value.replace('T', ' ').slice(0, 16) : value
+}
+
+function getHostnameLabel(url: string | null | undefined) {
+  if (!url) {
+    return ''
+  }
+
+  try {
+    return new URL(url).hostname
+  } catch {
+    return url
+  }
 }
 
 function getOverallScore(result: SearchResponse, profile: EntityProfileResponse | null) {
@@ -628,7 +609,6 @@ function App() {
   const [entityPageLoading, setEntityPageLoading] = useState(false)
   const [entityPageError, setEntityPageError] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const [searchStepIndex, setSearchStepIndex] = useState(0)
   const resultSectionRef = useRef<HTMLElement | null>(null)
 
   // Media upload state
@@ -701,13 +681,6 @@ function App() {
 
   const evidenceFilters: EvidenceFilter[] = ['全部', '最新', '支持疑慮', '反駁疑慮', '官方', '新聞', '論壇', '社群']
   const isEntityRoute = route.name === 'entity'
-  const quickQuestions = entityQuestions.length
-    ? entityQuestions.map((item) => item.question_text)
-    : (animalFocus ? ANIMAL_FOCUS_QUESTIONS : COMMON_QUESTIONS)
-  const searchProgressSteps = animalFocus ? ANIMAL_SEARCH_PROGRESS_STEPS : SEARCH_PROGRESS_STEPS
-  const questionPlaceholder = animalFocus
-    ? '例如：是否可能涉及動保法、超收、飼養環境或照護問題？'
-    : '例如：是否有動物福利爭議？'
   const sourceTypeSummary = result ? buildSourceTypeSummary(result.evidence_cards) : []
   const platformCards = result ? result.evidence_cards.filter((c) => matchPlatform(c, activePlatform)) : []
   const visibleCards = result ? filterEvidenceCards(activeFilter, platformCards) : []
@@ -716,9 +689,6 @@ function App() {
   const entityPagePlatformCards = entitySnapshot ? entitySnapshot.evidence_cards.filter((card) => matchPlatform(card, activePlatform)) : []
   const entityPageVisibleCards = entitySnapshot ? filterEvidenceCards(activeFilter, entityPagePlatformCards).slice(0, 6) : []
   const entityPageSourceSummary = entitySnapshot ? buildSourceTypeSummary(entitySnapshot.evidence_cards) : []
-  const entityPageScore = entitySnapshot
-    ? Math.max(0, Math.min(100, Math.round((profile?.average_credibility ?? entitySnapshot.summary.confidence) * 0.5 + entitySnapshot.summary.confidence * 0.5)))
-    : 0
   const selectedEntityLabel = entityPageData?.entity_name ?? profile?.entity_name ?? entitySnapshot?.entity_name ?? entityName
 
   useEffect(() => {
@@ -815,19 +785,6 @@ function App() {
       // Ignore storage failures on restricted browsers.
     }
   }, [activeFilter, activePlatform, animalFocus, entityName, profile, question, result])
-
-  useEffect(() => {
-    if (!loading) {
-      setSearchStepIndex(0)
-      return
-    }
-
-    const timer = window.setInterval(() => {
-      setSearchStepIndex((previous) => (previous + 1) % searchProgressSteps.length)
-    }, 1200)
-
-    return () => window.clearInterval(timer)
-  }, [loading, searchProgressSteps])
 
   useEffect(() => {
     if (result) {
@@ -977,8 +934,7 @@ function App() {
       const pageData: EntityPageResponse = await pageResponse.json()
       setEntityPageData(pageData)
 
-      // Load crawled reviews and stats in parallel
-      loadCrawledReviews(targetEntity)
+      void loadCrawledReviews(targetEntity)
 
       return pageData
     } catch {
@@ -1045,10 +1001,6 @@ function App() {
     navigateToRoute({ name: 'entity', entityName: item.name })
   }
 
-  function handleQuestionSelect(nextQuestion: string) {
-    setQuestion(nextQuestion)
-  }
-
   function scrollToPageTop() {
     requestAnimationFrame(() => {
       window.scrollTo({ top: 0, behavior: 'smooth' })
@@ -1063,20 +1015,6 @@ function App() {
       scrollToPageTop()
     }
     setRoute(nextRoute)
-  }
-
-  function handleAnimalFocusToggle() {
-    const next = !animalFocus
-    setAnimalFocus(next)
-    setQuestion((current) => {
-      if (next && (!current.trim() || COMMON_QUESTIONS.includes(current))) {
-        return ANIMAL_FOCUS_QUESTIONS[0]
-      }
-      if (!next && ANIMAL_FOCUS_QUESTIONS.includes(current)) {
-        return COMMON_QUESTIONS[0]
-      }
-      return current
-    })
   }
 
   function handleEntityPick(item: EntityListItem) {
@@ -1217,11 +1155,16 @@ function App() {
   async function createEntityComment(targetEntity: string, commentText: string) {
     const response = await fetch(`${API_BASE_URL}/api/entities/${encodeURIComponent(targetEntity)}/comments`, {
       method: 'POST',
+      credentials: 'include',
       headers: {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({ comment: commentText }),
     })
+
+    if (response.status === 401) {
+      throw new Error('LOGIN_REQUIRED')
+    }
 
     if (!response.ok) {
       const payload = await response.json().catch(() => null)
@@ -1250,18 +1193,25 @@ function App() {
       await loadEntityPage(targetEntity)
       setUploadComment('')
     } catch (err) {
-      setCommentError(err instanceof Error ? err.message : '評論送出失敗，請稍後再試。')
+      if (err instanceof Error && err.message === 'LOGIN_REQUIRED') {
+        openLoginDialog('登入後才能留下評論與補充資訊。')
+      } else {
+        setCommentError(err instanceof Error ? err.message : '評論送出失敗，請稍後再試。')
+      }
     } finally {
       setCommentSubmitting(false)
     }
   }
 
-  async function uploadSingleFile(file: File, idx: number, targetEntity: string) {
+  async function uploadSingleFile(file: File, idx: number, targetEntity: string, commentText = '') {
     setUploadQueue((prev) => prev.map((item, i) => i === idx ? { ...item, status: 'uploading' as const, progress: 0 } : item))
 
     const formData = new FormData()
     formData.append('file', file)
     formData.append('entity_name', targetEntity)
+    if (commentText) {
+      formData.append('comment', commentText)
+    }
 
     try {
       const xhr = new XMLHttpRequest()
@@ -1306,29 +1256,32 @@ function App() {
 
     setCommentError(null)
 
-    if (commentText) {
-      try {
-        setCommentSubmitting(true)
+    setCommentSubmitting(true)
+    try {
+      if (commentText) {
         await createEntityComment(targetEntity, commentText)
-      } catch (err) {
-        setCommentSubmitting(false)
-        setCommentError(err instanceof Error ? err.message : '評論送出失敗，請稍後再試。')
-        return
       }
+
+      const newItems = fileArray.map((f) => ({ file: f, progress: 0, status: 'pending' as const }))
+      setUploadQueue((prev) => [...prev, ...newItems])
+
+      const startIdx = uploadQueue.length
+      for (let i = 0; i < fileArray.length; i++) {
+        await uploadSingleFile(fileArray[i], startIdx + i, targetEntity, commentText)
+      }
+
+      await Promise.all([loadMediaFiles(targetEntity), loadEntityPage(targetEntity)])
+      if (commentText) {
+        setUploadComment('')
+      }
+    } catch (err) {
+      if (err instanceof Error && err.message === 'LOGIN_REQUIRED') {
+        openLoginDialog('登入後才能留下評論與補充資訊。')
+      } else {
+        setCommentError(err instanceof Error ? err.message : '資訊送出失敗，請稍後再試。')
+      }
+    } finally {
       setCommentSubmitting(false)
-    }
-
-    const newItems = fileArray.map((f) => ({ file: f, progress: 0, status: 'pending' as const }))
-    setUploadQueue((prev) => [...prev, ...newItems])
-
-    const startIdx = uploadQueue.length
-    for (let i = 0; i < fileArray.length; i++) {
-      await uploadSingleFile(fileArray[i], startIdx + i, targetEntity)
-    }
-
-    await Promise.all([loadMediaFiles(targetEntity), loadEntityPage(targetEntity)])
-    if (commentText) {
-      setUploadComment('')
     }
   }
 
@@ -1694,7 +1647,7 @@ function App() {
                     {card.notes ? <p className="review-note">{card.notes}</p> : null}
 
                     <div className="review-footer">
-                      <span className="review-url">{new URL(card.url).hostname}</span>
+                      <span className="review-url">{getHostnameLabel(card.url)}</span>
                       <a href={card.url} target="_blank" rel="noreferrer" className="view-original">
                         查看原文 →
                       </a>
@@ -1723,6 +1676,17 @@ function App() {
                   placeholder="例如：今天看到欄舍潮濕、有異味，動物活動空間偏小。也可以補充時間、地點與觀察到的情況。"
                 />
                 <p className="upload-form-hint">可先填評論，再拖拉照片／影片上傳；評論會一起附在這批檔案上。</p>
+                <div className="comment-action-row">
+                  <button
+                    type="button"
+                    className="primary-btn comment-submit-btn"
+                    onClick={() => void handleCommentSubmit()}
+                    disabled={commentSubmitting || !uploadComment.trim()}
+                  >
+                    {commentSubmitting ? '送出中...' : '送出文字評論'}
+                  </button>
+                  {commentError ? <span className="comment-error-text">{commentError}</span> : null}
+                </div>
               </div>
 
               <div
@@ -2054,7 +2018,7 @@ function App() {
                         <h4 className="review-title">{card.title}</h4>
                         <p className="review-snippet">{getCardExcerpt(card)}</p>
                         <div className="review-footer">
-                          <span className="review-url">{new URL(card.url).hostname}</span>
+                          <span className="review-url">{getHostnameLabel(card.url)}</span>
                           <a href={card.url} target="_blank" rel="noreferrer" className="view-original">
                             查看原文 →
                           </a>
@@ -2168,13 +2132,15 @@ function App() {
                           <p className="crawled-review-summary">📝 {review.short_summary}</p>
                         ) : null}
                         <p className="crawled-review-content">{review.content}</p>
-                        {review.parent_title ? (
+                        {review.source_url ? (
                           <div className="crawled-review-source">
-                            {review.source_url ? (
-                              <a href={review.source_url} target="_blank" rel="noopener noreferrer">{review.parent_title}</a>
-                            ) : (
-                              <span>{review.parent_title}</span>
-                            )}
+                            <a href={review.source_url} target="_blank" rel="noopener noreferrer">
+                              {review.parent_title || getHostnameLabel(review.source_url) || '查看來源'}
+                            </a>
+                          </div>
+                        ) : review.parent_title ? (
+                          <div className="crawled-review-source">
+                            <span>{review.parent_title}</span>
                           </div>
                         ) : null}
                         <ReviewRatingBar
